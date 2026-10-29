@@ -27,6 +27,13 @@ PIDF="$BASE/clientes/$ID/tela-ssh.pid"
 case "$ACAO" in
 
 subir)
+    # serializa subir/parar por cliente: o timeout de 90s do web.py mata so o
+    # wrapper python e o bash daqui segue ORFAO — completa scp/tarefa DEPOIS,
+    # competindo com o subir seguinte (Set-Content da instancia nova trunca o
+    # log da velha, http.sys entrega o viewer pra instancia errada = stream
+    # 200 sem quadro nenhum). flock sai sozinho quando o orfao morrer.
+    exec 9>>"$BASE/clientes/$ID/tela.lock"
+    flock -w 75 9 || { echo "FALHOU: outro tela.sh deste cliente rodando" >&2; exit 1; }
     # mata instancia anterior (tarefa de sessao passada pode ter deixado
     # powershell vivo segurando a porta) e sobe o .ps1 na sessao logada:
     # captura/injecao SO funcionam fora da sessao 0. /ru Interactive roda
@@ -44,20 +51,26 @@ subir)
 
     # encaminhamento persistente: porta local do servidor -> listener no
     # cliente (localhost:28090 — o Host tem que bater com o prefixo do
-    # HttpListener, que roda sem privilegio so em localhost)
+    # HttpListener, que roda sem privilegio so em localhost). Forward velho
+    # de um subir anterior segura a porta local e responde pelo listener ja
+    # morto: derruba ANTES — com ExitOnForwardFailure o ssh novo morreria
+    # calado sem conseguir bindar.
+    pkill -f -- "-L 127.0.0.1:${PORTA_LOCAL}:localhost:28090" 2>/dev/null || true
     ssh -N $KSSH $KHOST -i "$CHAVE" -p "$PORTA" \
         -L "127.0.0.1:${PORTA_LOCAL}:localhost:28090" "$USUARIO@localhost" \
         >/dev/null 2>&1 &
     echo $! > "$PIDF"
 
-    # espera o LISTENER responder (probe HTTP de verdade: o socket do ssh -L
-    # aceita conexao mesmo com o cliente la atras morto — falso positivo)
+    # espera o LISTENER responder de verdade (probe HTTP: o socket do ssh -L
+    # aceita conexao mesmo com o cliente la atras morto — e exit 0 do curl
+    # aceita QUALQUER resposta, ate erro; so JSON comeca com '{')
     for _ in $(seq 40); do
-        if curl -s -m 2 -H 'Host: localhost:28090' \
-                "http://127.0.0.1:$PORTA_LOCAL/info" >/dev/null 2>&1; then
-            echo "tela no ar: 127.0.0.1:$PORTA_LOCAL (cid=$ID)"
-            exit 0
-        fi
+        resp=$(curl -s -m 2 -H 'Host: localhost:28090' \
+                "http://127.0.0.1:$PORTA_LOCAL/info" 2>/dev/null) || true
+        case "$resp" in
+            '{'*) echo "tela no ar: 127.0.0.1:$PORTA_LOCAL (cid=$ID)"
+                  exit 0;;
+        esac
         sleep 0.5
     done
     echo "FALHOU: tela no ar nao respondeu (tarefa /it sobe? alguem logado?)" >&2

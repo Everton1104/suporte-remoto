@@ -37,9 +37,33 @@ conta e SIDs" → fallback para `/it` puro, que funciona porque o usuário
 do túnel é o logado; se forem usuários diferentes a UI não sobe); o kill
 de powershells precisa da guarda `-ne $PID` (a linha de comando da própria
 sessão contém 'suporte-tela.ps1' — sem a guarda ela se mata: exit 255
-silencioso); e o probe de "tela no ar" é um GET `/info` HTTP (o socket do
-`ssh -L` aceita conexão mesmo com o listener morto no cliente — probe de
-TCP puro dá falso positivo).
+silencioso); e o probe de "tela no ar" é um GET `/info` HTTP **cujo corpo
+tem que começar com `{`** (o socket do `ssh -L` aceita conexão mesmo com o
+listener morto no cliente, e exit 0 do curl aceita qualquer resposta —
+TCP puro ou curl-sem-corpão dão falso positivo).
+
+## Carregando eternamente (lição de campo, 29/10/2026)
+
+Sintoma: página do tela em "carregando" pra sempre, log do web.py com
+"subir ok" e stream 200 — mas **zero quadros**. Causa-raiz dupla:
+
+1. **`Close()` vs `Abort()` no tela.ps1**: se a captura/injeção falha
+   depois de o viewer conectar, o `Close()` dá flush nos headers 200
+   multipart pendentes e termina limpo — o navegador recebe "200 ok"
+   sem um JPEG e como multipart não tem fim, **nem onload nem onerror
+   disparam**. Correção: captura de PROVA antes de comprometer o viewer
+   (falha = 500 com o motivo) e `Abort()` no catch do EscreveQuadro. A
+   página também tem watchdog: sem 1º quadro em 14s = reconecta.
+2. **Subirs sobrepostos**: o timeout de 90s do web.py mata só o wrapper
+   python — o bash do tela.sh segue **órfão** e completa scp/tarefa
+   DEPOIS, competindo com o subir seguinte (log truncado pelo
+   `Set-Content` da instância nova, http.sys entregando o viewer pra
+   instância errada). Correção: `flock` no tela.sh (um subir/parar por
+   cliente), forward `-L` velho derrubado antes de abrir o novo
+   (ExitOnForwardFailure matava o ssh novo em silêncio), e no web.py o
+   probe ignora resposta que não seja JSON + janitor com hard-cap de
+   5 min (handler travado segurando `ativos>0` respondia 409 pra
+   todo mundo).
 
 ## Limitações conhecidas
 

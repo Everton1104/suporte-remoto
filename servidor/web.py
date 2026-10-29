@@ -556,7 +556,11 @@ def _janitor_terminais():
                 _matar_terminal(t)
         for cid in list(TELAS):
             t = TELAS[cid]
-            if t["ativos"] <= 0 and time.time() - t["ultima"] > _TELA_IDLE_S:
+            # 45s sem viewer = rotina; hard-cap de 5 min derruba ate com
+            # ativos>0 — handler travado (que segura atos e responde 409 pra
+            # todo mundo) nao pode viciar a tela deste cliente
+            if (t["ativos"] <= 0 and time.time() - t["ultima"] > _TELA_IDLE_S) \
+                    or time.time() - t["ultima"] > 300:
                 TELAS.pop(cid, None)
                 print("tela fechada por inatividade (cid=%s)" % cid, flush=True)
                 _tela_parar(cid)
@@ -1093,17 +1097,37 @@ async function bombear(){
   bombeando=false;
 }
 
-let rede=0;
+let rede=0,watchdog=0;
 function novaConexao(){
   rede=Date.now();
   return '/painel/tela/stream?cid='+encodeURIComponent(cid)+'&r='+rede;
 }
-img.onload=()=>{ st.textContent='ao vivo'; st.className=''; };
-// stream que morre depois de vivo (janitor/cliente caiu) → volta pra lista
-img.onerror=()=>{ if(Date.now()-rede>15000){
-  st.textContent='stream encerrado — voltando pra lista…'; st.className='err';
-  setTimeout(()=>location.href='/painel',2000); } };
-img.src=novaConexao();
+img.onload=()=>{ st.textContent='ao vivo'; st.className=''; tentativas=0;
+                 clearTimeout(watchdog); };
+// erro cedo (subida lenta, viewer em outra aba, listener morto): sem isto
+// a pagina ficava PRETA em silencio — agora avisa e reconecta 2x antes de
+// desistir; stream que morre depois de vivo → volta pra lista
+let tentativas=0;
+function semSinal(){
+  if(Date.now()-rede>15000){
+    st.textContent='stream encerrado — voltando pra lista…'; st.className='err';
+    setTimeout(()=>location.href='/painel',2000);
+  }else if(tentativas<2){
+    tentativas++; st.textContent='conectando… (tentativa '+tentativas+')';
+    setTimeout(()=>{ img.src=novaConexao(); arma(); },1500);
+  }else{
+    st.textContent='tela não respondeu — voltando pra lista…'; st.className='err';
+    setTimeout(()=>location.href='/painel',2000);
+  }
+}
+// 200 multipart SEM quadro nenhum: nem onload nem onerror disparam e o <img>
+// fica "carregando" eternamente — watchdog reconecta se o 1o quadro nao vier
+function arma(){
+  clearTimeout(watchdog);
+  watchdog=setTimeout(()=>{ if(Date.now()-rede>=13000) semSinal(); },14000);
+}
+img.onerror=semSinal;
+img.src=novaConexao(); arma();
 
 // ---- entrada: coordenadas normalizadas (0..1) casam com o desktop
 // virtual do cliente mesmo com a captura reduzida ----
@@ -1423,14 +1447,23 @@ class Handler(BaseHTTPRequestHandler):
         sock = None
         try:
             try:
-                _tela_http(cid, "/info")          # encaminhamento no ar?
+                r = _tela_http(cid, "/info")      # encaminhamento no ar?
+                # resposta vazia/lixo = forward zombie apontando pra listener
+                # morto: sem isto o probe "passa" e o relay entrega 200 sem
+                # um unico quadro (pagina carregando pra sempre)
+                if not r.strip().startswith(b"{"):
+                    raise OSError("probe sem resposta real: %r" % r[:60])
             except (OSError, KeyError):
                 _tela_subir(cid)                  # primeira vez: sobe tudo
             sock = socket.create_connection(("127.0.0.1", _tela_porta_local(cid)),
                                              timeout=12)
-            # HTTP/1.0: o HttpListener entrega o corpo delimitado por close
-            # (sem chunked) e a gente repassa multipart cru pro navegador
-            sock.sendall(b"GET /mjpeg HTTP/1.0\r\nHost: localhost:28090\r\n\r\n")
+            # HTTP/1.1 obrigatório: com 1.0 o http.sys não tem chunked nem
+            # Content-Length e SEGURA o corpo (responde 200 e nenhum quadro
+            # — tela preta no navegador; curl sempre falou 1.1, por isso os
+            # testes passavam). Em 1.1 vem Transfer-Encoding: chunked e o
+            # decodificador adiante repassa o multipart cru.
+            sock.sendall(b"GET /mjpeg HTTP/1.1\r\nHost: localhost:28090\r\n"
+                         b"Connection: close\r\n\r\n")
             sock.settimeout(20)
             buf = b""
             while b"\r\n\r\n" not in buf:
@@ -1481,7 +1514,7 @@ class Handler(BaseHTTPRequestHandler):
             pass                            # aba fechou — normal
         except OSError as exc:
             print("tela: stream encerrou (cid=%s): %s" % (cid, exc), flush=True)
-        except RuntimeError as exc:
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
             self._erro(502, "subir tela falhou: %s" % exc)
         finally:
             if sock:

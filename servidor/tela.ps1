@@ -169,7 +169,10 @@ function EscreveQuadro {
         $script:ultimoQuadro = Get-Date
     } catch {
         Log "viewer desconectou ($($_.Exception.Message))"
-        try { $tela.Response.Close() } catch {}
+        # Abort, nao Close: Close da flush nos headers 200 pendentes e termina
+        # o chunked limpo — o navegador via "200 ok" sem um quadro e ficava
+        # carregando eternamente. Abort descarta tudo e derruba a conexao.
+        try { $tela.Response.Abort() } catch {}
         $script:tela = $null
     }
 }
@@ -200,13 +203,29 @@ while ($rodando -and $escuta.IsListening) {
                 $ctx.Response.StatusCode = 409
                 $ctx.Response.Close()
             } else {
-                $r = $ctx.Response
-                $r.StatusCode = 200
-                $r.ContentType = 'multipart/x-mixed-replace; boundary=frame'
-                $r.SendChunked = $true
-                $tela = $ctx                    # headers saem no 1o write
-                $ultimoViewer = Get-Date
-                Log "viewer conectado"
+                # captura de PROVA antes de comprometer o viewer: se CopyFromScreen
+                # nao rola nesta sessao (task caiu na sessao 0), responder 200
+                # multipart vazio deixava o <img> "carregando" pra sempre —
+                # multipart sem fim nao dispara onerror no navegador. 500 com o
+                # motivo vira 502 honesto la no relay.
+                $falha = $null
+                try { $null = Capturar } catch { $falha = $_.Exception.Message }
+                if ($falha) {
+                    Log "ERRO captura: $falha"
+                    $ctx.Response.StatusCode = 500
+                    $ctx.Response.ContentType = 'text/plain'
+                    $b = [Text.Encoding]::UTF8.GetBytes("captura falhou: $falha")
+                    $ctx.Response.OutputStream.Write($b, 0, $b.Length)
+                    $ctx.Response.Close()
+                } else {
+                    $r = $ctx.Response
+                    $r.StatusCode = 200
+                    $r.ContentType = 'multipart/x-mixed-replace; boundary=frame'
+                    $r.SendChunked = $true
+                    $tela = $ctx                # headers saem no 1o write
+                    $ultimoViewer = Get-Date
+                    Log "viewer conectado"
+                }
             }
         } elseif ($metodo -eq 'POST' -and $caminho -eq '/input') {
             $leitor = New-Object IO.StreamReader($ctx.Request.InputStream,
