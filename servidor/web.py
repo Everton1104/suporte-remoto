@@ -1474,7 +1474,11 @@ class Handler(BaseHTTPRequestHandler):
             cab, resto = buf.split(b"\r\n\r\n", 1)
             linha1 = cab.split(b"\r\n")[0].decode("latin1", "replace")
             if " 200" not in linha1:
-                raise OSError("listener respondeu: " + linha1)
+                # o corpo do erro vem do tela.ps1 (ex.: "captura falhou: ..."
+                # quando nao ha sessao logada) — RuntimeError carrega o motivo
+                # ate a pagina como 502 honesto em vez de engolir
+                detalhe = resto.strip()[:200].decode("latin1", "replace")
+                raise RuntimeError("listener no cliente: %s %s" % (linha1, detalhe))
             ctype = "multipart/x-mixed-replace; boundary=frame"
             for ln in cab.split(b"\r\n")[1:]:
                 if ln.lower().startswith(b"content-type:"):
@@ -1515,7 +1519,7 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             print("tela: stream encerrou (cid=%s): %s" % (cid, exc), flush=True)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
-            self._erro(502, "subir tela falhou: %s" % exc)
+            self._erro(502, "tela falhou: %s" % exc)
         finally:
             if sock:
                 try:
