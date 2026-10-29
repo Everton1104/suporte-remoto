@@ -34,7 +34,9 @@ public static class Inj {
 "@
 
 $log = 'C:\Users\Public\suporte-tela.log'
-function Log($m) { Add-Content -Path $log -Value ("{0} {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }
+# try/catch: com ErrorActionPreference=Stop, um Add-Content falho DENTRO de um
+# catch (ex.: log apagado por um parar racing) escaparia e mataria o loop todo
+function Log($m) { try { Add-Content -Path $log -Value ("{0} {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) } catch {} }
 Set-Content -Path $log -Value ("{0} inicio porta={1}" -f (Get-Date -Format 'HH:mm:ss'), $Porta)
 
 # flags mouse_event
@@ -189,15 +191,17 @@ $inicio = Get-Date
 $ultimoBat = Get-Date
 while ($rodando -and $escuta.IsListening) {
     if (((Get-Date) - $inicio).TotalMinutes -ge $SessaoMaxMin) { Log "fim: sessao maxima"; break }
-    # heartbeat no log: se "travar" de novo, o log mostra se o loop morreu
-    # (linhas param) ou seguiu vivo (quadros continuam contando)
-    if (((Get-Date) - $ultimoBat).TotalSeconds -ge 60) {
-        Log "vivo quadros=$($script:quadros) viewer=$($null -ne $tela)"
-        $ultimoBat = Get-Date
-    }
     $task = $escuta.GetContextAsync()
     while (-not $task.Wait(150)) {
         if (-not $rodando) { break }
+        # heartbeat no log: se "travar" de novo, o log mostra se o loop morreu
+        # (linhas param) ou seguiu vivo (quadros continuam contando). AQUI no
+        # loop interno: o externo so roda quando chega request — assistindo
+        # sem input nenhum, ele nunca iterava e o heartbeat nunca logava
+        if (((Get-Date) - $ultimoBat).TotalSeconds -ge 60) {
+            Log "vivo quadros=$($script:quadros) viewer=$($null -ne $tela)"
+            $ultimoBat = Get-Date
+        }
         if ($null -ne $tela) {
             if (((Get-Date) - $ultimoQuadro).TotalMilliseconds -ge $Intervalo) {
                 EscreveQuadro
