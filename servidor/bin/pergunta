@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# pergunta — caixa de input na tela do usuário do cliente; a resposta
+# digitada volta para este terminal. Atalho de servidor/pergunta.sh com
+# resolução de cliente por pedaço do nome.
+# uso: pergunta <cliente> <pergunta...>   (espera até 5 min pela resposta)
+set -euo pipefail
+BASE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+[ $# -ge 2 ] || { echo "uso: pergunta <cliente> <pergunta...>"; exit 1; }
+ALVO=$1; shift
+ID=$(python3 -c "
+import json,sys
+cs=json.load(open(sys.argv[1]))['clientes']
+a=sys.argv[2].lower()
+h=[k for k,c in cs.items() if a in k.lower() or a in c.get('maquina','').lower() or a in c.get('nome','').lower()]
+print(h[0] if len(h)==1 else '|'.join(h))" "$BASE/clientes.json" "$ALVO")
+case "$ID" in
+  "") echo "nenhum cliente casa com '$ALVO'"; exit 1 ;;
+  *\|*) echo "ambíguo, casa com:"; echo "$ID" | tr '|' '\n'; exit 1 ;;
+esac
+exec bash "$BASE/pergunta.sh" "$ID" "$@"

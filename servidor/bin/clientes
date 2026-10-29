@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# clientes — lista os clientes registrados e quem está com túnel aberto (●).
+BASE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+python3 -c "
+import json,socket,sys
+cs=json.load(open(sys.argv[1]))['clientes']
+for k,c in sorted(cs.items(), key=lambda kv: kv[1].get('nome','')):
+    s=socket.socket(); s.settimeout(0.3)
+    on=s.connect_ex(('127.0.0.1', c['porta']))==0; s.close()
+    print(('●' if on else '○'), k, '—', c.get('nome',''), '(porta %d, %s)' % (c['porta'], c.get('so','')))
+" "$BASE/clientes.json"
