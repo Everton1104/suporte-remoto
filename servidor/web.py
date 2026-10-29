@@ -47,6 +47,7 @@ import secrets
 import select
 import signal
 import socket
+import sys
 import struct
 import subprocess
 import termios
@@ -567,21 +568,43 @@ def _tela_porta_local(cid):
     return carregar()["clientes"][cid]["porta"] + 20000
 
 
+_SUB_RESETA_SIGCHLD = (
+    "import signal, subprocess, sys; "
+    "signal.signal(signal.SIGCHLD, signal.SIG_DFL); "
+    "sys.exit(subprocess.call(sys.argv[1:]))")
+
+
+def _sub_tela(argv, timeout):
+    """Roda tela.sh via um python intermediario que devolve SIGCHLD ao
+    default. O boot do web.py seta SIGCHLD=SIG_IGN (anti-zombie dos pty
+    dos terminais) e essa disposicao se propaga por fork+exec: o bash do
+    tela.sh herdava SIGCHLD ignorado, nao conseguia esperar os proprios
+    filhos e morria no meio do scp com saida vazia — e o wait do Python
+    com SIG_IGN nao le o rc real (fabrica 0), entao o retorno deste
+    wrapper tambem e sempre rc=0: sucesso se le pela SAIDA ("tela no
+    ar"), nunca pelo rc. resetar via signal.signal direto aqui nao da:
+    handler roda em thread de request e signal so funciona na main
+    thread — dai o processo extra com main thread propria."""
+    return subprocess.run([sys.executable, "-c", _SUB_RESETA_SIGCHLD] + list(argv),
+                          capture_output=True, text=True, timeout=timeout)
+
+
 def _tela_subir(cid):
     """Sobe o tela.ps1 no cliente + o ssh -L (tela.sh subir)."""
+    t0 = time.time()
     try:
-        r = subprocess.run([os.path.join(BASE, "tela.sh"), cid, "subir"],
-                           capture_output=True, text=True, timeout=90)
+        r = _sub_tela([os.path.join(BASE, "tela.sh"), cid, "subir"], 90)
     except subprocess.TimeoutExpired:
         raise RuntimeError("tela.sh subir não respondeu (90s)")
-    if r.returncode != 0:
+    if "tela no ar" not in (r.stdout or ""):
         raise RuntimeError((r.stderr or r.stdout or "sem saída").strip())
+    print("tela: subir ok (cid=%s) em %.1fs: %s" % (
+        cid, time.time() - t0, (r.stdout or "").strip()), flush=True)
 
 
 def _tela_parar(cid):
     try:
-        subprocess.run([os.path.join(BASE, "tela.sh"), cid, "parar"],
-                       capture_output=True, timeout=45)
+        _sub_tela([os.path.join(BASE, "tela.sh"), cid, "parar"], 45)
     except Exception as exc:
         print("tela: parar falhou (cid=%s): %s" % (cid, exc), flush=True)
 
