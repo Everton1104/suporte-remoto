@@ -1,0 +1,131 @@
+<!doctype html><html><head><meta charset=utf-8>
+<meta http-equiv="Content-Security-Policy"
+      content="default-src none; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<style>
+ body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:12px}
+ h2{margin:0 0 4px;font-size:15px;font-weight:600}
+ .sub{color:#777;font-size:11px;margin-bottom:12px}
+ .card{border:1px solid #333;border-radius:8px;padding:10px 12px;margin-bottom:10px;
+       background:#161616;max-width:640px}
+ .card.on{border-left:4px solid #2c8}
+ .card.off{border-left:4px solid #555}
+ .topo{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+ .nome{font-size:15px;font-weight:600;cursor:pointer;
+       text-decoration:underline dotted #777}
+ .ed{background:#111;border:1px solid #2c8;color:#eee;padding:2px 6px;
+     font-size:14px;font-family:inherit;min-width:0}
+ .st{font-size:10px;font-weight:600;padding:2px 8px;border-radius:99px;letter-spacing:.5px}
+ .st.on{background:#2c8;color:#041}
+ .st.off{background:#3a3a3a;color:#999}
+ .meta{color:#888;font-size:11px;margin-bottom:8px}
+ .meta b{color:#bbb;font-weight:500}
+ .acoes{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+ button{border:0;border-radius:4px;padding:6px 10px;cursor:pointer;font-size:12px}
+ .conectar{background:#2c8;color:#041;font-weight:600}
+ .conectar:disabled{background:#283528;color:#577;font-weight:400;cursor:not-allowed}
+ .encerrar{background:#c33;color:#fff;font-weight:600}
+ .remover{background:#8a2626;color:#fff}
+ .confirmar{background:#a33;color:#fff;font-weight:600}
+ .term{background:#26304a;color:#fff}
+ .claude{background:#5a3c8c;color:#fff}
+ .term:disabled,.claude:disabled{background:#1d2333;color:#556;cursor:not-allowed}
+ .espera{background:#444;color:#ddd;cursor:wait}
+ .card .acoes button:nth-child(1){grid-column:1/-1}
+ .card .acoes button:nth-child(3),
+ .card .acoes button:nth-child(4){order:1}
+ .card .acoes button:nth-child(2){grid-column:1/-1;order:2}
+ .vazio{color:#777;font-size:13px}
+ .pontos i{font-style:normal;animation:pisca 1.2s infinite;opacity:0}
+ .pontos i:nth-child(2){animation-delay:.2s}
+ .pontos i:nth-child(3){animation-delay:.4s}
+ @keyframes pisca{0%,60%,100%{opacity:0}30%{opacity:1}}
+</style></head><body>
+<h2>Clientes instalados</h2>
+<div class=sub>mesma API do painel — atualiza a cada 5s · terminal e claude abrem no terminal integrado · clique no nome para renomear</div>
+<div id=lista><div class=vazio>carregando…</div></div>
+<script>
+const vscode=acquireVsCodeApi();
+const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+let cs=[];                          // último dados recebidos
+let editando=null;                  // id com edição inline aberta (pausa o repaint)
+const pend={}, pendEnc={}, confRem={};
+
+function pintar(){
+  for(const k in pend) if(Date.now()-pend[k]>90000) delete pend[k];
+  for(const k in pendEnc) if(Date.now()-pendEnc[k]>90000) delete pendEnc[k];
+  for(const k in confRem) if(Date.now()-confRem[k]>4000) delete confRem[k];
+  document.getElementById('lista').innerHTML = cs.map(c=>{
+    if(c.tunel) delete pend[c.id]; else delete pendEnc[c.id];
+    const semT = c.online ? 'sem túnel — conecte primeiro'
+                          : 'cliente offline — o agente não reporta ao servidor';
+    const acaoBtn = c.remover
+      ? '<button class=encerrar disabled title="auto-desinstala no próximo contato">pend. remoção</button>'
+      : (c.tunel
+        ? (pendEnc[c.id]
+          ? '<button class=espera disabled title="fechando o túnel">encerrando<span class=pontos><i>.</i><i>.</i><i>.</i></span></button>'
+          : `<button class=encerrar onclick="fazer('encerrar','${esc(c.id)}')">encerrar</button>`)
+        : (pend[c.id]
+          ? '<button class=espera disabled title="abrindo o túnel">conectando<span class=pontos><i>.</i><i>.</i><i>.</i></span></button>'
+          : (c.online
+            ? `<button class=conectar onclick="fazer('conectar','${esc(c.id)}')">conectar</button>`
+            : '<button class=conectar disabled title="cliente offline">conectar</button>')));
+    const ativo = c.tunel && c.online;
+    const trav = ativo ? `onclick="term('${esc(c.id)}',0)"` : `disabled title="${semT}"`;
+    const travC = ativo ? `onclick="term('${esc(c.id)}',1)"` : `disabled title="${semT}"`;
+    const conf = confRem[c.id];
+    const remBtn = conf
+      ? `<button class=confirmar title="clique de novo para confirmar"
+          onclick="fazer('remover','${esc(c.id)}',1)">confirmar?</button>`
+      : `<button class=remover
+          onclick="fazer('remover','${esc(c.id)}')">remover</button>`;
+    return `<div class="card ${c.online?'on':'off'}">
+      <div class=topo><span class=nome title="clique para renomear"
+        onclick="renomear('${esc(c.id)}','${esc(c.nome)}',this)">${esc(c.nome)}</span>
+        <span class="st ${c.online?'on':'off'}">${c.online?'online':'offline'}</span></div>
+      <div class=meta><b>${esc(c.id)}</b> · ${esc(c.maquina)} · ${esc(c.so)} ·
+        porta ${c.porta} · túnel ${c.tunel?'ABERTO':'—'} · contato ${esc(c.ultimo_contato)}</div>
+      <div class=acoes>
+        ${acaoBtn}
+        ${remBtn}
+        <button class=term ${trav}>terminal</button>
+        <button class=claude ${travC}>claude</button>
+      </div></div>`;
+  }).join('') || '<div class=vazio>nenhum cliente instalado</div>';
+}
+
+// renomear inline: o span vira um input — prompt() nativo não abre em
+// webview (sandbox sem allow-modals), então nada de diálogos do browser
+function renomear(id,atual,el){
+  if(editando) return;
+  editando=id;
+  const inp=document.createElement('input');
+  inp.className='ed'; inp.value=atual; inp.maxLength=60;
+  el.replaceWith(inp); inp.focus(); inp.select();
+  let fim=false;
+  const fechar=(salvar)=>{
+    if(fim) return; fim=true; editando=null;
+    if(salvar && inp.value.trim() && inp.value!==atual)
+      vscode.postMessage({tipo:'nome',id:id,nome:inp.value.trim()});
+    else pintar();                              // volta o span como estava
+  };
+  inp.onkeydown=e=>{ if(e.key==='Enter') fechar(true);
+                     if(e.key==='Escape') fechar(false); };
+  inp.onblur=()=>fechar(false);
+}
+
+function fazer(a,id,confirmado){
+  if(a==='remover' && !confirmado){            // 1º clique arma, 2º executa
+    confRem[id]=Date.now(); pintar();
+    setTimeout(()=>{ if(confRem[id]&&Date.now()-confRem[id]>=3900){delete confRem[id]; pintar();} },4100);
+    return;
+  }
+  delete confRem[id];
+  if(a==='conectar') pend[id]=Date.now();
+  if(a==='encerrar') pendEnc[id]=Date.now();
+  vscode.postMessage({tipo:'acao',acao:a,id:id});
+}
+function term(id,cl){ vscode.postMessage({tipo:'term',id:id,claude:!!cl}); }
+window.addEventListener('message',e=>{
+  if(e.data.tipo==='dados'){ cs=e.data.clientes; if(!editando) pintar(); }
+});
+</script></body></html>

@@ -1,0 +1,42 @@
+{
+  "name": "suporte-remoto",
+  "displayName": "Suporte Remoto",
+  "description": "Painel dos PCs cadastrados no suporte-remoto, dentro do VSCode: status, conectar/encerrar túnel, terminal e claude por cliente.",
+  "version": "0.1.0",
+  "publisher": "evertonrs",
+  "license": "MIT",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onCommand:suporte.clientes", "onView:suporte.painel"],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "suporte", "title": "Suporte Remoto", "icon": "media/icon.svg" }
+      ]
+    },
+    "views": {
+      "suporte": [
+        { "type": "webview", "id": "suporte.painel", "name": "Clientes" }
+      ]
+    },
+    "commands": [
+      { "command": "suporte.clientes", "title": "Suporte: Clientes" }
+    ],
+    "configuration": {
+      "title": "Suporte Remoto",
+      "properties": {
+        "suporte.baseDir": {
+          "type": "string",
+          "default": "/root/CODE/suporte-remoto",
+          "description": "Diretório do projeto suporte-remoto (onde vivem atender.sh e clientes.json)"
+        },
+        "suporte.porta": {
+          "type": "number",
+          "default": 8090,
+          "description": "Porta local do web.py"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# segredos e estado do servidor — NUNCA versionar
+servidor/clientes.json
+servidor/clientes/
+servidor/sessoes/
+servidor/.sessoes.json
+suporte-2026*.sh
+
+# binários espelhados em servidor/static (centenas de MB;
+# servidor/atualizar-espelho.sh rebaixa tudo quando preciso)
+servidor/static/*
+!servidor/static/versoes.json
+
+# artefatos gerados
+servidor/__pycache__/
+*.pyc
+servidor/extensoes/*.vsix
+
+# preferências locais de editor/agentes
+.claude/settings.local.json
