@@ -11,6 +11,7 @@ CLIENTE=$1
 PORTA_REVERSA=10022   # porta que abre AQUI e cai no PC do cliente
 PORTA_PROXY=2222      # porta local do cloudflared no cliente (mesma do nosso sshd)
 DOMINIO=${DOMINIO:-ssh.evertonrs.com.br}
+URL_BASE=${URL_BASE:-https://suporte.evertonrs.com.br}
 USER_TUNEL=suporte
 BASE=$(cd "$(dirname "$0")" && pwd)
 
@@ -38,6 +39,7 @@ B64=$(base64 -w0 "$DIR/chave-cliente")
 sed -e "s|__SESSION__|$ID|g" \
     -e "s|__CLIENTE__|$CLIENTE|g" \
     -e "s|__DOMINIO__|$DOMINIO|g" \
+    -e "s|__URL_BASE__|$URL_BASE|g" \
     -e "s|__PORTA_PROXY__|$PORTA_PROXY|g" \
     -e "s|__PORTA_REVERSA__|$PORTA_REVERSA|g" \
     -e "s|__PUBKEY_TECNICO__|$(cat "$DIR/chave-tecnico.pub")|" \

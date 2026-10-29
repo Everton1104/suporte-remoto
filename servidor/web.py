@@ -82,6 +82,10 @@ ARQUIVOS_MIRROR = {   # rota /arquivos/<nome> -> content-type (whitelist fechada
     "cloudflared-windows-amd64.exe": "application/octet-stream",
     "cloudflared-linux-amd64": "application/octet-stream",
     "cloudflared-linux-arm64": "application/octet-stream",
+    # bootstrap do instalador: máquinas sem curl (Win < 1803) baixam o
+    # nosso com certutil antes de qualquer outra coisa
+    "curl.exe": "application/octet-stream",
+    "curl-ca-bundle.crt": "application/octet-stream",
 }
 ATUALIZACOES = {}     # nome -> {"espelho","atual"} quando o GitHub tem versão nova
 CHECAGEM = {"quando": 0.0, "erro": ""}

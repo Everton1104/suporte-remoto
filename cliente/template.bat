@@ -75,10 +75,25 @@ echo __PUBKEY_TECNICO__>> "%AK%"
 icacls "%AK%" /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" >nul
 
 REM --- 5) baixa o cloudflared (binario oficial assinado pela Cloudflare) ---
+REM     curl do Windows; maquina sem curl (Win < 1803) baixa o nosso espelho
+REM     com certutil - build LibreSSL, precisa do bundle CA pro HTTPS
 if not exist "%WORK%" mkdir "%WORK%"
+set "CURL=curl"
+set "CURLCA= "
+where curl >nul 2>&1 || (
+    certutil -urlcache -split -f "__URL_BASE__/arquivos/curl-ca-bundle.crt" "%WORK%\curl-ca-bundle.crt" >nul
+    certutil -urlcache -split -f "__URL_BASE__/arquivos/curl.exe" "%WORK%\curl.exe" >nul
+    set "CURL=%WORK%\curl.exe"
+    set "CURLCA=--cacert "%WORK%\curl-ca-bundle.crt""
+)
+if not "%CURL%"=="curl" if not exist "%CURL%" (
+    echo   FALHOU: Windows sem curl e o download dele falhou. Internet ok?
+    pause
+    exit /b 1
+)
 if not exist "%WORK%\cloudflared.exe" (
     echo   Baixando cloudflared...
-    curl -L -o "%WORK%\cloudflared.exe" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
+    "%CURL%" %CURLCA% -L -o "%WORK%\cloudflared.exe" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
 )
 
 REM --- 6) reconstrui a chave efemera desta sessao (veio embutida em base64) ---

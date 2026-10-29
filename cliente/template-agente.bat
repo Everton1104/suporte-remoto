@@ -35,7 +35,35 @@ echo.
 echo   Instalando o agente de suporte remoto (automatico)...
 echo.
 
-REM --- 1) OpenSSH Server (zip espelhado no nosso servidor = segundos;
+REM --- 1) baixador: todo Windows 10 1803+ ja vem com curl, mas maquinas
+REM     velhas chegam sem ele - e o :baixar depende do curl. Sem achar no
+REM     PATH, baixa o nosso espelho com certutil (existe em TODO Windows
+REM     desde o Vista). O exe e build LibreSSL: precisa do bundle CA do
+REM     lado por causa do HTTPS (curl do Windows usa o store nativo, o
+REM     nosso nao usa).
+where curl >nul 2>&1 || goto curldl
+set "CURL=curl"
+set "CURLCA= "
+goto curlok
+:curldl
+set "CBIN=%TEMP%\suporte-curl"
+if not exist "%CBIN%" mkdir "%CBIN%"
+echo   Este Windows nao tem curl - baixando o nosso...
+certutil -urlcache -split -f "%URL%/arquivos/curl-ca-bundle.crt" "%CBIN%\curl-ca-bundle.crt" >nul
+certutil -urlcache -split -f "%URL%/arquivos/curl.exe" "%CBIN%\curl.exe" >nul
+set "CURL=%CBIN%\curl.exe"
+set "CURLCA=--cacert "%CBIN%\curl-ca-bundle.crt""
+if not exist "%CBIN%\curl.exe" goto curlruim
+for %%F in ("%CBIN%\curl.exe") do if %%~zF LSS 3000000 goto curlruim
+"%CURL%" --version >nul 2>&1 || goto curlruim
+goto curlok
+:curlruim
+echo   FALHOU: download do curl. Internet/proxy ok? Tente de novo.
+pause
+exit /b 1
+:curlok
+
+REM --- 2) OpenSSH Server (zip espelhado no nosso servidor = segundos;
 REM     Windows Update fica como plano B se o nosso servidor nao responder) ---
 sc query sshd >nul 2>&1
 if errorlevel 1 (
@@ -53,11 +81,11 @@ if errorlevel 1 (
 sc config sshd start= auto >nul 2>&1
 sc query sshd | findstr /I "RUNNING" >nul || net start sshd >nul
 
-REM --- 2) PowerShell como shell padrao do SSH (comandos caem direto nele) ---
+REM --- 3) PowerShell como shell padrao do SSH (comandos caem direto nele) ---
 reg add "HKLM\SOFTWARE\OpenSSH" /v DefaultShell /t REG_SZ /d "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" /f >nul
 
-REM --- 3) pasta de trabalho + chave do tunel (gerada AQUI, persistente) ---
-REM     o zip do passo 1 ja trouxe o cliente ssh inteiro (ssh, ssh-keygen) e o
+REM --- 4) pasta de trabalho + chave do tunel (gerada AQUI, persistente) ---
+REM     o zip do passo 2 ja trouxe o cliente ssh inteiro (ssh, ssh-keygen) e o
 REM     install-sshd poe a pasta no PATH da maquina: usar esses binarios deixa o
 REM     Windows Update FORA do caminho - so entra se faltar o zip E o cliente
 if not exist "%DIR%" mkdir "%DIR%"
@@ -78,7 +106,7 @@ icacls "%DIR%\chave-tunel" /inheritance:r /grant "*S-1-5-18:F" "*S-1-5-32-544:F"
 icacls "%DIR%\chave-tunel" /remove "%USERDOMAIN%\%USERNAME%" >nul 2>&1
 icacls "%DIR%\chave-tunel" /setowner "*S-1-5-18" >nul 2>&1
 
-REM --- 4) cloudflared (do nosso espelho; GitHub como plano B) ---
+REM --- 5) cloudflared (do nosso espelho; GitHub como plano B) ---
 REM     re-baixa se faltar, vier truncado (< 5 MB) ou quebrado (nao executa):
 REM     uma instalacao cancelada no meio do download deixa arquivo parcial
 if not exist "%DIR%\cloudflared.exe" goto cfdl
@@ -94,7 +122,7 @@ if not exist "%DIR%\cloudflared.exe" (
 )
 :cfok
 
-REM --- 5) registra no servidor (idempotente: mesma chave = mesmo cliente) ---
+REM --- 6) registra no servidor (idempotente: mesma chave = mesmo cliente) ---
 REM     JSON montado à mão: chave_tunel via ConvertTo-Json garante string escapada
 REM     (hashtable + ConvertTo-Json no PS 5.1 já mandou objeto onde era string)
 echo   Registrando no servidor...
@@ -105,13 +133,13 @@ if not exist "%DIR%\registro.json" (
     exit /b 1
 )
 
-REM --- 6) instala a chave publica do tecnico DESTE cliente ---
+REM --- 7) instala a chave publica do tecnico DESTE cliente ---
 for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "(Get-Content '%DIR%\registro.json' | ConvertFrom-Json).pubkey_tecnico"`) do set "PUBTEC=%%K"
 if not exist "%AK%" type nul > "%AK%"
 findstr /C:"%PUBTEC%" "%AK%" >nul || >> "%AK%" echo %PUBTEC%
 icacls "%AK%" /inheritance:r /grant "*S-1-5-32-544:F" "*S-1-5-18:F" >nul
 
-REM --- 7) para o agente antigo ANTES de reescrever os arquivos ---
+REM --- 8) para o agente antigo ANTES de reescrever os arquivos ---
 REM     o powershell em execucao mantem agente.ps1 aberto: sobrescrever com
 REM     ele vivo falha em silencio (certutil nao escreve) e a tarefa sobe
 REM     com o agente VELHO. Mata tambem zumbis de instalacoes antigas:
@@ -124,7 +152,7 @@ powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='ss
 schtasks /end /tn SuporteRemoto >nul 2>&1
 schtasks /delete /tn SuporteRemoto /f >nul 2>&1
 
-REM --- 8) escreve o agente e o desinstalador (embutidos em base64) ---
+REM --- 9) escreve o agente e o desinstalador (embutidos em base64) ---
 >  "%DIR%\b64.tmp" echo __AGENTE_PS1_B64__
 certutil -decode "%DIR%\b64.tmp" "%DIR%\agente.ps1" >nul
 >  "%DIR%\b64.tmp" echo __DESINSTALAR_PS1_B64__
@@ -134,7 +162,7 @@ del "%DIR%\b64.tmp" >nul 2>&1
 >> "%DIR%\desinstalar.cmd" echo powershell -NoProfile -ExecutionPolicy Bypass -File "%%~dp0desinstalar.ps1"
 >> "%DIR%\desinstalar.cmd" echo pause
 
-REM --- 9) servico: tarefa agendada no boot, SYSTEM, sempre rodando ---
+REM --- 10) servico: tarefa agendada no boot, SYSTEM, sempre rodando ---
 schtasks /create /tn SuporteRemoto /sc onstart /delay 0001:00 /ru SYSTEM /rl HIGHEST /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%DIR%\agente.ps1\"" >nul
 schtasks /run /tn SuporteRemoto >nul 2>&1
 
@@ -152,10 +180,11 @@ exit /b 0
 REM --- baixa mostrando pontos: curl roda em 2o plano e a janela vai
 REM     pontuando ate ele terminar - o usuario ve movimento e nao fecha
 REM     achando que travou (55 MB podem levar minutos em rede lenta).
+REM     %CURL%/%CURLCA% vem do passo 1 (curl do sistema ou o nosso).
 REM     uso: call :baixar "destino" "url" "nome amigavel"
 :baixar
 <nul set /p dummy="   Baixando %~3 "
-start "" /b curl -sL -f --connect-timeout 20 --speed-time 30 --speed-limit 51200 -o "%~1" "%~2"
+start "" /b "%CURL%" -sL -f %CURLCA% --connect-timeout 20 --speed-time 30 --speed-limit 51200 -o "%~1" "%~2"
 :baiando
 ping -n 2 127.0.0.1 >nul
 <nul set /p dummy=.
