@@ -35,12 +35,12 @@ echo.
 echo   Instalando o agente de suporte remoto (automatico)...
 echo.
 
-REM --- 1) baixador: todo Windows 10 1803+ ja vem com curl, mas maquinas
-REM     velhas chegam sem ele - e o :baixar depende do curl. Sem achar no
-REM     PATH, baixa o nosso espelho com certutil (existe em TODO Windows
-REM     desde o Vista). O exe e build LibreSSL: precisa do bundle CA do
-REM     lado por causa do HTTPS (curl do Windows usa o store nativo, o
-REM     nosso nao usa).
+REM --- 1) baixador, em ordem de preferencia: (a) curl do proprio Windows
+REM     (10 1803+); (b) o curl EMBUTIDO neste .bat (base64 decodificado
+REM     com certutil) - maquina velha sem curl nao baixa nada a mais;
+REM     (c) espelho no servidor via certutil (existe em TODO Windows
+REM     desde o Vista). O nosso exe e build LibreSSL: HTTPS precisa do
+REM     bundle CA do lado (o curl do Windows usa o store nativo).
 where curl >nul 2>&1 || goto curldl
 set "CURL=curl"
 set "CURLCA= "
@@ -48,17 +48,26 @@ goto curlok
 :curldl
 set "CBIN=%TEMP%\suporte-curl"
 if not exist "%CBIN%" mkdir "%CBIN%"
-echo   Este Windows nao tem curl - baixando o nosso...
+echo   Este Windows nao tem curl - preparando o embutido (uns segundos)...
+call :curl-embutido
+if not exist "%CBIN%\curl.exe" goto curlnet
+if not exist "%CBIN%\curl-ca-bundle.crt" goto curlnet
+goto curlchk
+:curlnet
+echo   curl embutido indisponivel - baixando do espelho...
 certutil -urlcache -split -f "%URL%/arquivos/curl-ca-bundle.crt" "%CBIN%\curl-ca-bundle.crt" >nul
 certutil -urlcache -split -f "%URL%/arquivos/curl.exe" "%CBIN%\curl.exe" >nul
+:curlchk
+if not exist "%CBIN%\curl.exe" goto curlruim
+if not exist "%CBIN%\curl-ca-bundle.crt" goto curlruim
+for %%F in ("%CBIN%\curl.exe") do if %%~zF LSS 3000000 goto curlruim
+"%CBIN%\curl.exe" --version >nul 2>&1 || goto curlruim
 set "CURL=%CBIN%\curl.exe"
 set "CURLCA=--cacert "%CBIN%\curl-ca-bundle.crt""
-if not exist "%CBIN%\curl.exe" goto curlruim
-for %%F in ("%CBIN%\curl.exe") do if %%~zF LSS 3000000 goto curlruim
-"%CURL%" --version >nul 2>&1 || goto curlruim
 goto curlok
 :curlruim
-echo   FALHOU: download do curl. Internet/proxy ok? Tente de novo.
+echo   FALHOU: sem curl no Windows e nem o embutido nem o espelho
+echo   responderam. Internet/proxy ok? Tente de novo.
 pause
 exit /b 1
 :curlok
@@ -192,3 +201,13 @@ tasklist /fi "imagename eq curl.exe" 2>nul | find /i "curl.exe" >nul && goto bai
 echo.
 if exist "%~1" exit /b 0
 exit /b 1
+
+REM --- curl.exe + bundle CA embutidos em base64 (linhas geradas pelo
+REM     render do web.py, ~1.400 echos de 4 KB cada): certutil -decode
+REM     monta os arquivos e o base64 e apagado. Alfabeto base64 nao tem
+REM     nenhum caractere especial do cmd, vai cru mesmo. Validacao de
+REM     tamanho/execucao fica no passo 1, depois do call.
+:curl-embutido
+if exist "%CBIN%\curl.exe" exit /b 0
+__CURL_EMBUTIDO__
+exit /b 0

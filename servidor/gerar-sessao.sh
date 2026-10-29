@@ -35,7 +35,9 @@ printf 'restrict,port-forwarding,permitlisten="%s",permitopen="127.0.0.1:1",comm
 # chave privada do cliente em base64 para embutir no .bat (o Windows decodifica com certutil)
 B64=$(base64 -w0 "$DIR/chave-cliente")
 
-# renderiza o .bat (a conversão final para CRLF evita pegadinhas do cmd.exe)
+# renderiza o .bat: sed troca os campos, e o python final embute o curl
+# (base64 em echos de 4 KB — inviável no sed) e converte pra CRLF
+# (pegadinha do cmd.exe)
 sed -e "s|__SESSION__|$ID|g" \
     -e "s|__CLIENTE__|$CLIENTE|g" \
     -e "s|__DOMINIO__|$DOMINIO|g" \
@@ -44,7 +46,29 @@ sed -e "s|__SESSION__|$ID|g" \
     -e "s|__PORTA_REVERSA__|$PORTA_REVERSA|g" \
     -e "s|__PUBKEY_TECNICO__|$(cat "$DIR/chave-tecnico.pub")|" \
     -e "s|__CHAVE_CLIENTE_B64__|$B64|" \
-    "$BASE/../cliente/template.bat" | sed 's/$/\r/' > "$DIR/suporte-$ID.bat"
+    "$BASE/../cliente/template.bat" > "$DIR/.bat-parcial"
+python3 - "$DIR/.bat-parcial" "$DIR/suporte-$ID.bat" "$BASE/static" <<'PY'
+import base64, os, sys
+parcial, saida, static = sys.argv[1:4]
+t = open(parcial, encoding="utf-8").read()
+linhas = []
+for nome in ("curl.exe", "curl-ca-bundle.crt"):
+    try:
+        with open(os.path.join(static, nome), "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+    except OSError:
+        b64 = ""          # espelho ausente: .bat cai no download via certutil
+    arq = f"%WORK%\\{nome}.b64"     # f-string: % é literal (em %-format seria erro)
+    for i in range(0, len(b64), 4000):
+        op = ">" if i == 0 else ">>"
+        linhas.append(f'{op} "{arq}" echo {b64[i:i + 4000]}')
+    linhas.append(f'certutil -decode "{arq}" "%WORK%\\{nome}" >nul')
+    linhas.append(f'del "{arq}" >nul 2>&1')
+t = t.replace("__CURL_EMBUTIDO__", "\n".join(linhas))
+with open(saida, "w", encoding="utf-8", newline="") as f:
+    f.write(t.replace("\r\n", "\n").replace("\n", "\r\n"))
+PY
+rm -f "$DIR/.bat-parcial"
 
 # versão Linux: mesmo render, sem CRLF, executável
 sed -e "s|__SESSION__|$ID|g" \

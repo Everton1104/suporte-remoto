@@ -547,6 +547,28 @@ def _janitor_terminais():
 
 # ---------------- instaladores ----------------
 
+def bloco_curl_b64(destino):
+    """Linhas `> file echo <chunk>` que materializam o curl.exe + bundle CA
+    de dentro do .bat (base64 decodificado pelo certutil do cliente). É o
+    plano A da máquina sem curl: nada sai da rede antes do passo 2. Sem os
+    binários em static/ (clone novo sem espelho), devolve [] — o .bat cai
+    direto no plano B (download via certutil). `destino` é a var batch do
+    diretório (%CBIN% no agente, %WORK% na sessão)."""
+    linhas = []
+    for nome in ("curl.exe", "curl-ca-bundle.crt"):
+        try:
+            with open(os.path.join(BASE, "static", nome), "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+        except OSError:
+            return []
+        arq_b64 = "%s\\%s.b64" % (destino, nome)
+        for i in range(0, len(b64), 4000):        # linha cmd tem limite de 8191
+            linhas.append('%s "%s" echo %s' % (">" if i == 0 else ">>", arq_b64, b64[i:i + 4000]))
+        linhas.append('certutil -decode "%s" "%s\\%s" >nul' % (arq_b64, destino, nome))
+        linhas.append('del "%s" >nul 2>&1' % arq_b64)
+    return linhas
+
+
 def gerar_instalador_agente(linux):
     """Renderiza o instalador do agente permanente (um arquivo só)."""
     if linux:
@@ -559,7 +581,8 @@ def gerar_instalador_agente(linux):
     bat = render("template-agente.bat", {"__URL_BASE__": URL_BASE, "__DOMINIO__": DOMINIO,
                                          "__PORTA_PROXY__": str(PORTA_PROXY),
                                          "__AGENTE_PS1_B64__": base64.b64encode(ps1.encode()).decode(),
-                                         "__DESINSTALAR_PS1_B64__": base64.b64encode(des.encode()).decode()})
+                                         "__DESINSTALAR_PS1_B64__": base64.b64encode(des.encode()).decode(),
+                                         "__CURL_EMBUTIDO__": "\n".join(bloco_curl_b64("%CBIN%"))})
     return "suporte-agente.bat", bat.encode()
 
 

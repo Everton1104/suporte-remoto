@@ -75,22 +75,37 @@ echo __PUBKEY_TECNICO__>> "%AK%"
 icacls "%AK%" /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" >nul
 
 REM --- 5) baixa o cloudflared (binario oficial assinado pela Cloudflare) ---
-REM     curl do Windows; maquina sem curl (Win < 1803) baixa o nosso espelho
-REM     com certutil - build LibreSSL, precisa do bundle CA pro HTTPS
+REM     baixador em ordem: curl do Windows (10 1803+) -> curl EMBUTIDO
+REM     neste .bat (base64 + certutil) -> espelho do servidor via certutil
+REM     (presente em TODO Windows). O nosso exe e build LibreSSL: HTTPS
+REM     exige o bundle CA do lado.
 if not exist "%WORK%" mkdir "%WORK%"
 set "CURL=curl"
 set "CURLCA= "
-where curl >nul 2>&1 || (
-    certutil -urlcache -split -f "__URL_BASE__/arquivos/curl-ca-bundle.crt" "%WORK%\curl-ca-bundle.crt" >nul
-    certutil -urlcache -split -f "__URL_BASE__/arquivos/curl.exe" "%WORK%\curl.exe" >nul
-    set "CURL=%WORK%\curl.exe"
-    set "CURLCA=--cacert "%WORK%\curl-ca-bundle.crt""
-)
-if not "%CURL%"=="curl" if not exist "%CURL%" (
-    echo   FALHOU: Windows sem curl e o download dele falhou. Internet ok?
-    pause
-    exit /b 1
-)
+where curl >nul 2>&1 && goto curlok
+echo   Este Windows nao tem curl - preparando o embutido (uns segundos)...
+call :curl-embutido
+if not exist "%WORK%\curl.exe" goto curlnet
+if not exist "%WORK%\curl-ca-bundle.crt" goto curlnet
+goto curlchk
+:curlnet
+echo   curl embutido indisponivel - baixando do espelho...
+certutil -urlcache -split -f "__URL_BASE__/arquivos/curl-ca-bundle.crt" "%WORK%\curl-ca-bundle.crt" >nul
+certutil -urlcache -split -f "__URL_BASE__/arquivos/curl.exe" "%WORK%\curl.exe" >nul
+:curlchk
+if not exist "%WORK%\curl.exe" goto curlruim
+if not exist "%WORK%\curl-ca-bundle.crt" goto curlruim
+for %%F in ("%WORK%\curl.exe") do if %%~zF LSS 3000000 goto curlruim
+"%WORK%\curl.exe" --version >nul 2>&1 || goto curlruim
+set "CURL=%WORK%\curl.exe"
+set "CURLCA=--cacert "%WORK%\curl-ca-bundle.crt""
+goto curlok
+:curlruim
+echo   FALHOU: sem curl no Windows e nem o embutido nem o espelho
+echo   responderam. Internet/proxy ok? Tente de novo.
+pause
+exit /b 1
+:curlok
 if not exist "%WORK%\cloudflared.exe" (
     echo   Baixando cloudflared...
     "%CURL%" %CURLCA% -L -o "%WORK%\cloudflared.exe" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
@@ -163,4 +178,12 @@ if exist "%USERPROFILE%\.ssh\known_hosts" ssh-keygen -R "[localhost]:__PORTA_PRO
 echo.
 echo   Sessao encerrada. Nenhum acesso restante neste computador.
 pause
+exit /b 0
+
+REM --- curl.exe + bundle CA embutidos em base64 (linhas geradas pelo
+REM     gerar-sessao.sh, ~1.400 echos de 4 KB): certutil -decode monta
+REM     os arquivos e o base64 e apagado. So roda sem curl no PATH.
+:curl-embutido
+if exist "%WORK%\curl.exe" exit /b 0
+__CURL_EMBUTIDO__
 exit /b 0
