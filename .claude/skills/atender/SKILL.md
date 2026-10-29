@@ -87,3 +87,5 @@ scp -P <porta> -i servidor/clientes/<cid>/chave-tecnico \
 - **Fechar túnel**: decisão e ação do técnico, no painel — **nunca** execute
   `encerrar` você mesmo (no máximo, lembre o técnico de fechar ao terminar).
 - **Falar com o usuário do cliente** (popup na tela dele): skill `pergunta-cliente`.
+- **Ver/controlar a tela do cliente** (botão tela do painel): skill `tela` —
+  controle remoto sempre com o usuário ciente.

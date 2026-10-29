@@ -171,6 +171,17 @@ del "%DIR%\b64.tmp" >nul 2>&1
 >> "%DIR%\desinstalar.cmd" echo powershell -NoProfile -ExecutionPolicy Bypass -File "%%~dp0desinstalar.ps1"
 >> "%DIR%\desinstalar.cmd" echo pause
 
+REM --- 9b) comandos do tecnico no System32: suporte-mensagem (popup OK) e
+REM     suporte-pergunta (input com resposta) para uso dentro da sessao do
+REM     cliente; CRLF/BOM ja vem embutidos no base64
+>  "%DIR%\b64.tmp" echo __MSG_CMD_B64__
+certutil -decode "%DIR%\b64.tmp" "C:\Windows\System32\suporte-mensagem.cmd" >nul
+>  "%DIR%\b64.tmp" echo __PERG_CMD_B64__
+certutil -decode "%DIR%\b64.tmp" "C:\Windows\System32\suporte-pergunta.cmd" >nul
+>  "%DIR%\b64.tmp" echo __PERG_PS1_B64__
+certutil -decode "%DIR%\b64.tmp" "C:\Windows\System32\suporte-pergunta-run.ps1" >nul
+del "%DIR%\b64.tmp" >nul 2>&1
+
 REM --- 10) servico: tarefa agendada no boot, SYSTEM, sempre rodando ---
 schtasks /create /tn SuporteRemoto /sc onstart /delay 0001:00 /ru SYSTEM /rl HIGHEST /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%DIR%\agente.ps1\"" >nul
 schtasks /run /tn SuporteRemoto >nul 2>&1

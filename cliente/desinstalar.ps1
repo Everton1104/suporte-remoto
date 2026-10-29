@@ -27,6 +27,10 @@ if (Test-Path $ak) {
     icacls $ak /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
     if ((Get-Item $ak).Length -eq 0) { Remove-Item $ak -Force }
 }
+# comandos do tecnico plantados no System32 + temporarios do suporte-pergunta
+Remove-Item "$env:SystemRoot\System32\suporte-mensagem.cmd", "$env:SystemRoot\System32\suporte-pergunta.cmd", "$env:SystemRoot\System32\suporte-pergunta-run.ps1" -Force
+Remove-Item "$env:PUBLIC\suporte-pergunta-ui.ps1", "$env:PUBLIC\suporte-resposta.txt" -Force
+schtasks /delete /tn SuporteRemotoPergunta /f
 Write-Host 'Removendo arquivos...'
 Set-Location $env:SystemRoot
 # este script roda DESTE diretorio e o powershell segura o proprio .ps1 -

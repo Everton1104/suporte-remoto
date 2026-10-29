@@ -51,6 +51,25 @@ avise o técnico que a pergunta está na tela.
   `(sem resposta / cancelado)` = usuário cancelou ou deixou vazio;
   timeout de 5 min = "Sem resposta em 5 min".
 
+## Direto na sessão do cliente (sem passar pelo servidor)
+
+Plantados no System32 pelo instalador `instalar-cmds <cliente>` (=
+`servidor/instalar-suporte-cmds.sh`) **e pelo instalador do agente**
+(template-agente.bat, passo 9b — PC novo já nasce com eles; o
+desinstalar.ps1 remove junto). Uso dentro do terminal/SSH do cliente:
+`suporte-mensagem <texto>` e `suporte-pergunta <pergunta>` — a resposta
+imprime no próprio terminal. Fontes em `servidor/cliente-cmds/` (CRLF +
+BOM aplicados na instalação; no instalador do agente o web.py embute em
+base64 já convertido). O .ps1 interno chama-se
+`suporte-pergunta-run.ps1` DE PROPÓSITO: o PowerShell resolve `.ps1`
+antes de `.cmd` no PATH e a ExecutionPolicy Restricted bloquearia o
+carregamento direto — nome diferente força o .cmd (que chama o powershell
+com `-ExecutionPolicy Bypass`). A tarefa interativa usa `/ru Interactive`
+(roda como o usuário logado na tela, sem senha). Acentos: texto digitado
+na sessão do cliente embola na origem (codepage do shell); resposta
+acentuada pode embolar na exibição — o texto íntegro fica em
+`C:\Users\Public\suporte-resposta.txt` (UTF-8).
+
 ## Como funciona (para debug)
 
 Processo criado via SSH nasce na sessão 0, sem UI — a janela é aberta por

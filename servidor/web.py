@@ -20,6 +20,10 @@ Rotas do técnico:
   GET  /painel/term?cid=   -> página do terminal xterm do cliente
   GET  /painel/term/stream?cid=&s= -> PTY do atender.sh, saída em stream até fechar
   POST /painel/term/in?s=  -> teclas (corpo cru) | size (cols/rows) | fechar
+  GET  /painel/tela?cid=   -> página da tela ao vivo do cliente (MJPEG)
+  GET  /painel/tela/stream?cid= -> relay do stream do tela.ps1 (túnel reverso)
+  POST /painel/tela/in     -> evento de mouse/teclado (controle remoto)
+  POST /painel/tela/parar  -> derruba listener no cliente + ssh -L
   GET  /xterm.js /xterm.css /xterm-fit.js -> assets do terminal (servidor/static)
 
 Credenciais em servidor/clientes.json (reg.login, senha PBKDF2); o token_painel
@@ -76,6 +80,12 @@ TERMINAL_IDLE_S = 30 * 60   # terminal sem tráfego por 30min é fechado
 CLAUDE_SESSOES = {}
 CLAUDE_BUF_MAX = 512 * 1024   # scrollback por sessão (reanexo mostra isto)
 _CLAUDE_CRIAR_LOCK = threading.Lock()
+# tela do cliente (MJPEG + controle): o listener vive no cliente (tela.ps1
+# sobe via schtasks /it na sessão logada) e chega até aqui por um ssh -L
+# que o tela.sh mantém. Aqui só registramos quem está olhando, pra derrubar
+# tudo quando ninguém mais está.
+TELAS = {}                 # cid -> {"ativos": int, "ultima": ts}
+_TELA_IDLE_S = 45          # sem viewer por isto = derruba listener + ssh -L
 ARQ_VERSOES = os.path.join(BASE, "static", "versoes.json")   # versão do espelho
 ARQUIVOS_MIRROR = {   # rota /arquivos/<nome> -> content-type (whitelist fechada)
     "openssh-win64.zip": "application/zip",
@@ -543,6 +553,53 @@ def _janitor_terminais():
                 if CLAUDE_SESSOES.get(t["cid"]) is t:
                     CLAUDE_SESSOES.pop(t["cid"], None)
                 _matar_terminal(t)
+        for cid in list(TELAS):
+            t = TELAS[cid]
+            if t["ativos"] <= 0 and time.time() - t["ultima"] > _TELA_IDLE_S:
+                TELAS.pop(cid, None)
+                print("tela fechada por inatividade (cid=%s)" % cid, flush=True)
+                _tela_parar(cid)
+
+
+# ---------------- tela do cliente (MJPEG + controle) ----------------
+
+def _tela_porta_local(cid):
+    return carregar()["clientes"][cid]["porta"] + 20000
+
+
+def _tela_subir(cid):
+    """Sobe o tela.ps1 no cliente + o ssh -L (tela.sh subir)."""
+    try:
+        r = subprocess.run([os.path.join(BASE, "tela.sh"), cid, "subir"],
+                           capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("tela.sh subir não respondeu (90s)")
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "sem saída").strip())
+
+
+def _tela_parar(cid):
+    try:
+        subprocess.run([os.path.join(BASE, "tela.sh"), cid, "parar"],
+                       capture_output=True, timeout=45)
+    except Exception as exc:
+        print("tela: parar falhou (cid=%s): %s" % (cid, exc), flush=True)
+
+
+def _tela_http(cid, pedido, corpo=b""):
+    """POST cru no listener do cliente, pelo encaminhamento do tela.sh.
+    O Host header tem que ser localhost:28090: o HttpListener do .ps1 roda
+    sem urlacl de admin e casa o prefixo por host, não por IP."""
+    cab = ("POST %s HTTP/1.0\r\nHost: localhost:28090\r\n"
+           "Content-Type: application/json\r\nContent-Length: %d\r\n"
+           "Connection: close\r\n\r\n" % (pedido, len(corpo)))
+    with socket.create_connection(("127.0.0.1", _tela_porta_local(cid)), timeout=6) as s:
+        s.sendall(cab.encode() + corpo)
+        s.settimeout(6)
+        try:
+            return s.recv(256)
+        except OSError:
+            return b""
 
 
 # ---------------- instaladores ----------------
@@ -569,6 +626,17 @@ def bloco_curl_b64(destino):
     return linhas
 
 
+def cmds_cliente_b64(nome, bom=False):
+    """Base64 de um comando suporte-* de servidor/cliente-cmds para embutir
+    no instalador: CRLF sempre (+BOM no .ps1) — cmd e PS 5.1 no cliente
+    esperam essa codificação."""
+    with open(os.path.join(BASE, "cliente-cmds", nome)) as f:
+        t = f.read().replace("\r\n", "\n").replace("\n", "\r\n")
+    if bom:
+        t = "﻿" + t
+    return base64.b64encode(t.encode("utf-8")).decode()
+
+
 def gerar_instalador_agente(linux):
     """Renderiza o instalador do agente permanente (um arquivo só)."""
     if linux:
@@ -582,6 +650,9 @@ def gerar_instalador_agente(linux):
                                          "__PORTA_PROXY__": str(PORTA_PROXY),
                                          "__AGENTE_PS1_B64__": base64.b64encode(ps1.encode()).decode(),
                                          "__DESINSTALAR_PS1_B64__": base64.b64encode(des.encode()).decode(),
+                                         "__MSG_CMD_B64__": cmds_cliente_b64("suporte-mensagem.cmd"),
+                                         "__PERG_CMD_B64__": cmds_cliente_b64("suporte-pergunta.cmd"),
+                                         "__PERG_PS1_B64__": cmds_cliente_b64("suporte-pergunta-run.ps1", bom=True),
                                          "__CURL_EMBUTIDO__": "\n".join(bloco_curl_b64("%CBIN%"))})
     return "suporte-agente.bat", bat.encode()
 
@@ -649,6 +720,8 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
  .nome{cursor:pointer;text-decoration:underline dotted #777}
  .term{background:#26304a;color:#fff;border:0;border-radius:4px}
  .term:disabled{background:#1d2333;color:#556;cursor:not-allowed}
+ .telab{background:#2c6e49;color:#fff;border:0;border-radius:4px}
+ .telab:disabled{background:#1d2333;color:#556;cursor:not-allowed}
  .conectar{background:#2c8;color:#041;border:0;border-radius:4px;font-weight:600}
  .conectar:disabled{background:#283528;color:#577;cursor:not-allowed;font-weight:400}
  .encerrar{background:#c33;color:#fff;border:0;border-radius:4px;font-weight:600}
@@ -686,8 +759,9 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
   td:last-child{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
   td:last-child button{margin:0;width:100%;padding:12px 6px;font-size:15px}
   td:last-child button:first-child{grid-column:1/-1;order:-2}
-  td:last-child button:nth-child(3){grid-column:1/-1;order:-1}
-  td:last-child button:nth-child(2){grid-column:1/-1}
+  td:last-child button:nth-child(2){grid-column:1/-1;order:2}
+  td:last-child button:nth-child(3){order:-1}
+  td:last-child button:nth-child(4){order:-1}
  }
 </style>
 <h2>Clientes instalados <a class=sair href=/painel/sair>sair</a></h2>
@@ -740,6 +814,9 @@ async function carregar(){
       <button class=term ${(c.tunel&&c.online)
         ? `onclick="location.href='/painel/term?cid=${esc(c.id)}'"`
         : `disabled title="${semTunel}"`}>terminal</button>
+      <button class=telab ${(c.tunel&&c.online)
+        ? `onclick="location.href='/painel/tela?cid=${esc(c.id)}'"`
+        : `disabled title="${semTunel}"`}>tela</button>
     </td>
    </tr>`}).join('') || '<tr><td colspan=8 class=off>nenhum cliente instalado ainda</td></tr>';
   versoes(d);
@@ -924,6 +1001,162 @@ addEventListener('pagehide',()=>{
 </script>"""
 
 
+PAGINA_TELA = """<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>tela — __CID__</title>
+<style>
+ body{margin:0;background:#0d0f14;color:#eee;font-family:system-ui,sans-serif;
+      display:flex;flex-direction:column;height:100vh}
+ #barra{display:flex;align-items:center;gap:8px;padding:8px 12px;
+        background:#151923;border-bottom:1px solid #222;flex-wrap:wrap}
+ #barra .id{font-weight:600;font-size:14px}
+ #st{font-size:12px;color:#8f9}
+ #st.err{color:#f66}
+ button{border:0;border-radius:4px;padding:6px 12px;font-size:13px;cursor:pointer}
+ #ctl{background:#26304a;color:#fff}
+ #ctl.on{background:#a33;color:#fff;font-weight:600}
+ #parar{background:#8a2626;color:#fff}
+ #palco{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;
+        position:relative;overflow:hidden}
+ #tela{max-width:100%;max-height:100%;user-select:none;-webkit-user-drag:none}
+ #tela.controle{cursor:crosshair;outline:2px solid #a33}
+ #cursor{position:absolute;pointer-events:none;display:none;color:#f46;
+         font-weight:700;font-size:22px;line-height:1;
+         transform:translate(-50%,-50%);text-shadow:0 0 4px #000;z-index:2}
+ #dica{font-size:11px;color:#667;padding:6px 12px;text-align:center}
+</style>
+<div id=barra>
+ <span class=id>tela — __CID__</span>
+ <span id=st>conectando…</span>
+ <span style="flex:1"></span>
+ <button id=ctl>controlar</button>
+ <button id=parar>parar</button>
+</div>
+<div id=palco><img id=tela alt="tela do cliente"><div id=cursor>+</div></div>
+<div id=dica>assistindo — clique em "controlar" para mouse e teclado agirem no
+cliente (stream ~2-4 fps; os cliques chegam com um pequeno atraso)</div>
+<script>
+const cid='__CID__';
+const img=document.getElementById('tela'), st=document.getElementById('st'),
+      ctl=document.getElementById('ctl'), cursor=document.getElementById('cursor'),
+      dica=document.getElementById('dica');
+let controlando=false;
+
+// fila serial (um fetch por vez — mesmo padrão do terminal) com
+// coalescência: um move pendente é substituído pelo mais novo
+const fila=[];
+let bombeando=false;
+function enviar(ev){
+  if(ev.t==='move')
+    for(let i=fila.length-1;i>=0;i--) if(fila[i].t==='move'){fila.splice(i,1);break;}
+  fila.push(ev);
+  bombear();
+}
+async function bombear(){
+  if(bombeando) return;
+  bombeando=true;
+  while(fila.length){
+    const ev=fila.shift();
+    try{
+      const r=await fetch('/painel/tela/in',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(Object.assign({cid:cid},ev))});
+      if(r.status===502){ st.textContent='tela caiu — reconectando…';
+                          st.className='err'; img.src=novaConexao(); }
+    }catch(e){ /* próximo evento tenta de novo */ }
+  }
+  bombeando=false;
+}
+
+let rede=0;
+function novaConexao(){
+  rede=Date.now();
+  return '/painel/tela/stream?cid='+encodeURIComponent(cid)+'&r='+rede;
+}
+img.onload=()=>{ st.textContent='ao vivo'; st.className=''; };
+img.onerror=()=>{ if(Date.now()-rede>15000){
+  st.textContent='stream caiu — recarregue a página'; st.className='err'; } };
+img.src=novaConexao();
+
+// ---- entrada: coordenadas normalizadas (0..1) casam com o desktop
+// virtual do cliente mesmo com a captura reduzida ----
+function norm(e){
+  const r=img.getBoundingClientRect();
+  return {x:Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),
+          y:Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))};
+}
+function moveCursor(e){
+  const p=img.parentElement.getBoundingClientRect(), r=img.getBoundingClientRect();
+  cursor.style.left=(r.left-p.left+e.clientX-r.left)+'px';
+  cursor.style.top =(r.top -p.top +e.clientY-r.top )+'px';
+}
+const botao=b=>b===2?2:(b===1?1:0);
+let ultMove=0;
+img.addEventListener('pointermove',e=>{
+  if(!controlando) return;
+  moveCursor(e);
+  if(Date.now()-ultMove<50) return;
+  ultMove=Date.now();
+  enviar(Object.assign({t:'move'},norm(e)));
+});
+img.addEventListener('pointerdown',e=>{
+  if(!controlando) return;
+  e.preventDefault(); moveCursor(e);
+  enviar(Object.assign({t:'down',b:botao(e.button)},norm(e)));
+});
+img.addEventListener('pointerup',e=>{
+  if(!controlando) return;
+  enviar({t:'up',b:botao(e.button)});
+});
+img.addEventListener('contextmenu',e=>{ if(controlando) e.preventDefault(); });
+img.addEventListener('wheel',e=>{
+  if(!controlando) return;
+  e.preventDefault();
+  enviar({t:'scroll',d:Math.sign(e.deltaY)});
+},{passive:false});
+
+// teclado: F5/F12 e ctrl+r ficam no navegador; o resto vai pro cliente.
+// caractere vai como unicode (acentos ok); ctrl/alt+letra vira VK no .ps1
+const NOME={Enter:1,Backspace:1,Tab:1,Escape:1,Delete:1,Insert:1,Home:1,End:1,
+            PageUp:1,PageDown:1,ArrowLeft:1,ArrowUp:1,ArrowRight:1,ArrowDown:1};
+document.addEventListener('keydown',e=>{
+  if(!controlando) return;
+  if(e.key==='F5'||e.key==='F12'||(e.ctrlKey&&e.key.toLowerCase()==='r')) return;
+  if(NOME[e.key]||/^F([1-9]|1[0-2])$/.test(e.key)){
+    e.preventDefault();
+    enviar({t:'key',k:e.key,ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey});
+  }else if(e.key.length===1){
+    e.preventDefault();
+    enviar({t:'key',c:e.key,ctrl:e.ctrlKey,alt:e.altKey});
+  }
+});
+
+ctl.onclick=()=>{
+  if(!controlando){
+    if(!confirm('Controlar esta maquina? Cliques e teclas passam a agir no '+
+                'PC do cliente. De preferencia avise o usuario antes '+
+                '(popup mensagem.sh).')) return;
+    controlando=true;
+    ctl.textContent='controlando'; ctl.classList.add('on');
+    img.classList.add('controle'); cursor.style.display='block';
+    dica.textContent='controle ATIVO — mouse e teclado vao para o cliente. '+
+                     'Desligue com o mesmo botao.';
+  }else{
+    controlando=false;
+    ctl.textContent='controlar'; ctl.classList.remove('on');
+    img.classList.remove('controle'); cursor.style.display='none';
+    dica.textContent='assistindo — controle desligado';
+  }
+};
+document.getElementById('parar').onclick=async()=>{
+  await fetch('/painel/tela/parar',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cid:cid})});
+  st.textContent='encerrado'; st.className='err'; img.removeAttribute('src');
+};
+</script>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
@@ -1021,6 +1254,20 @@ class Handler(BaseHTTPRequestHandler):
                                   (qs.get("claude") or [""])[0] == "1",
                                   (qs.get("sess") or [""])[0],
                                   (qs.get("retomar") or [""])[0] == "1")
+        elif rota == "/painel/tela":
+            if not self._term_auth(qs):
+                self._redirect("/painel")
+                return
+            cid = (qs.get("cid") or [""])[0]
+            if cid not in carregar()["clientes"]:
+                self._erro(404, "cliente desconhecido")
+                return
+            self._html(PAGINA_TELA.replace("__CID__", cid))
+        elif rota == "/painel/tela/stream":
+            if not self._term_auth(qs):
+                self._erro(403, "sessao expirada — entre de novo")
+                return
+            self._stream_tela((qs.get("cid") or [""])[0])
         else:
             self._erro(404, "rota desconhecida")
 
@@ -1056,6 +1303,36 @@ class Handler(BaseHTTPRequestHandler):
                     corpo.get("token", ""), carregar()["token_painel"]):
                 raise PermissionError("token invalido")
             self._text(renomear(corpo.get("id", ""), corpo.get("nome", "")))
+        elif rota == "/painel/tela/in":
+            # evento de mouse/teclado da página da tela: {"cid", "t": ...}
+            ev = dict(corpo)
+            cid = ev.pop("cid", "")
+            if not self._sessao() and not hmac.compare_digest(
+                    ev.pop("token", ""), carregar()["token_painel"]):
+                self._erro(403, "sem sessão")
+                return
+            if not cid or cid not in carregar()["clientes"]:
+                self._erro(400, "cid ausente ou inválido")
+                return
+            try:
+                _tela_http(cid, "/input", json.dumps(ev).encode())
+            except OSError as exc:
+                self._erro(502, "tela fora do ar: %s" % exc)
+                return
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif rota == "/painel/tela/parar":
+            cid = corpo.get("cid", "")
+            if not self._sessao() and not hmac.compare_digest(
+                    corpo.get("token", ""), carregar()["token_painel"]):
+                self._erro(403, "sem sessão")
+                return
+            if not cid:
+                self._erro(400, "cid ausente")
+                return
+            threading.Thread(target=_tela_parar, args=(cid,), daemon=True).start()
+            self._json({"ok": True})
         elif rota == "/painel/verificar":
             # botão "procurar atualização" do painel: consulta o GitHub na hora
             # (a checagem automática roda a cada 6h desde o boot)
@@ -1098,6 +1375,93 @@ class Handler(BaseHTTPRequestHandler):
                 if not bloco:
                     break
                 self.wfile.write(bloco)
+
+    def _stream_tela(self, cid):
+        """Relay do MJPEG do cliente: na 1ª conexão sobe o tela.ps1 e o ssh -L
+        (tela.sh), depois repassa os bytes do listener pro navegador até a
+        aba fechar. Um viewer por cliente (o listener também recusa o 2º)."""
+        reg = carregar()
+        if cid not in reg["clientes"]:
+            self._erro(404, "cliente desconhecido")
+            return
+        t = TELAS.get(cid)
+        if t and t["ativos"] > 0:
+            self._erro(409, "tela já aberta em outra aba")
+            return
+        t = TELAS.setdefault(cid, {"ativos": 0, "ultima": time.time()})
+        t["ativos"] += 1
+        t["ultima"] = time.time()
+        sock = None
+        try:
+            try:
+                _tela_http(cid, "/info")          # encaminhamento no ar?
+            except (OSError, KeyError):
+                _tela_subir(cid)                  # primeira vez: sobe tudo
+            sock = socket.create_connection(("127.0.0.1", _tela_porta_local(cid)),
+                                             timeout=12)
+            # HTTP/1.0: o HttpListener entrega o corpo delimitado por close
+            # (sem chunked) e a gente repassa multipart cru pro navegador
+            sock.sendall(b"GET /mjpeg HTTP/1.0\r\nHost: localhost:28090\r\n\r\n")
+            sock.settimeout(20)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                pedaco = sock.recv(4096)
+                if not pedaco:
+                    raise OSError("listener fechou antes dos cabeçalhos")
+                buf += pedaco
+            cab, resto = buf.split(b"\r\n\r\n", 1)
+            linha1 = cab.split(b"\r\n")[0].decode("latin1", "replace")
+            if " 200" not in linha1:
+                raise OSError("listener respondeu: " + linha1)
+            ctype = "multipart/x-mixed-replace; boundary=frame"
+            for ln in cab.split(b"\r\n")[1:]:
+                if ln.lower().startswith(b"content-type:"):
+                    ctype = ln.split(b":", 1)[1].decode("latin1").strip()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            chunked = b"transfer-encoding: chunked" in cab.lower()
+            sobra = resto
+            while True:
+                if chunked:               # defesa: decodifica antes de repassar
+                    while True:
+                        i = sobra.find(b"\r\n")
+                        if i < 0:
+                            break
+                        try:
+                            n = int(sobra[:i].split(b";")[0].strip(), 16)
+                        except ValueError:
+                            break
+                        if len(sobra) < i + 2 + n + 2:
+                            break
+                        if n:
+                            self.wfile.write(sobra[i + 2:i + 2 + n])
+                        sobra = sobra[i + 2 + n + 2:]
+                        if n == 0:
+                            return
+                else:
+                    if sobra:
+                        self.wfile.write(sobra)
+                        sobra = b""
+                pedaco = sock.recv(65536)
+                if not pedaco:
+                    break
+                sobra += pedaco
+        except BrokenPipeError:
+            pass                            # aba fechou — normal
+        except OSError as exc:
+            print("tela: stream encerrou (cid=%s): %s" % (cid, exc), flush=True)
+        except RuntimeError as exc:
+            self._erro(502, "subir tela falhou: %s" % exc)
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            t["ativos"] -= 1
+            t["ultima"] = time.time()
 
     def _instalador(self, url, qs, funcao):
         so = (qs.get("so") or [""])[0].lower()
