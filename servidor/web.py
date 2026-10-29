@@ -1068,11 +1068,13 @@ cliente (stream ~2-4 fps; os cliques chegam com um pequeno atraso)</div>
 const cid='__CID__';
 const img=document.getElementById('tela'), st=document.getElementById('st'),
       ctl=document.getElementById('ctl'), cursor=document.getElementById('cursor'),
-      dica=document.getElementById('dica');
+      dica=document.getElementById('dica'), palco=document.getElementById('palco');
 let controlando=false;
 
 // fila serial (um fetch por vez — mesmo padrão do terminal) com
-// coalescência: um move pendente é substituído pelo mais novo
+// coalescência: um move pendente é substituído pelo mais novo. Evento SEM
+// confirmação (504/fetch falho) volta pra fila em vez de se perder — um
+// "up" perdido deixava o botao embaixado no cliente e "travava" tudo
 const fila=[];
 let bombeando=false;
 function enviar(ev){
@@ -1086,13 +1088,18 @@ async function bombear(){
   bombeando=true;
   while(fila.length){
     const ev=fila.shift();
+    let repondo=false;
     try{
       const r=await fetch('/painel/tela/in',{method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify(Object.assign({cid:cid},ev))});
       if(r.status===502){ st.textContent='tela caiu — reconectando…';
                           st.className='err'; img.src=novaConexao(); }
-    }catch(e){ /* próximo evento tenta de novo */ }
+      else if(r.status===504) repondo=true;
+    }catch(e){ repondo=true; }
+    if(repondo && ev.t!=='move' && (ev.n=(ev.n||0)+1)<3){
+      fila.unshift(ev); setTimeout(bombear,500); break;
+    }
   }
   bombeando=false;
 }
@@ -1143,24 +1150,27 @@ function moveCursor(e){
 }
 const botao=b=>b===2?2:(b===1?1:0);
 let ultMove=0;
-img.addEventListener('pointermove',e=>{
+// eventos no PALCO (a imagem pode ter bordas ao redor — clique ali era morto)
+// e contextmenu no documento: menu do navegador abrindo por cima roubava o
+// clique direito
+palco.addEventListener('pointermove',e=>{
   if(!controlando) return;
   moveCursor(e);
   if(Date.now()-ultMove<50) return;
   ultMove=Date.now();
   enviar(Object.assign({t:'move'},norm(e)));
 });
-img.addEventListener('pointerdown',e=>{
+palco.addEventListener('pointerdown',e=>{
   if(!controlando) return;
   e.preventDefault(); moveCursor(e);
   enviar(Object.assign({t:'down',b:botao(e.button)},norm(e)));
 });
-img.addEventListener('pointerup',e=>{
+palco.addEventListener('pointerup',e=>{
   if(!controlando) return;
   enviar({t:'up',b:botao(e.button)});
 });
-img.addEventListener('contextmenu',e=>{ if(controlando) e.preventDefault(); });
-img.addEventListener('wheel',e=>{
+document.addEventListener('contextmenu',e=>{ if(controlando) e.preventDefault(); });
+palco.addEventListener('wheel',e=>{
   if(!controlando) return;
   e.preventDefault();
   enviar({t:'scroll',d:Math.sign(e.deltaY)});
@@ -1368,9 +1378,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._erro(400, "cid ausente ou inválido")
                 return
             try:
-                _tela_http(cid, "/input", json.dumps(ev).encode())
+                r = _tela_http(cid, "/input", json.dumps(ev).encode())
             except OSError as exc:
                 self._erro(502, "tela fora do ar: %s" % exc)
+                return
+            # _tela_http engole timeout de recv devolvendo b"": sem isto a
+            # rota dava 204 de evento que o cliente nunca confirmou (o
+            # tela.ps1 podia estar congelado num frame) e a pagina perdia
+            # o clique — um "up" perdido deixava o botao embaixado la
+            if not r or b" 204" not in r.split(b"\r\n")[0]:
+                self._erro(504, "cliente não confirmou o evento")
                 return
             self.send_response(204)
             self.send_header("Content-Length", "0")
@@ -1487,6 +1504,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
+            # escrita pro navegador com teto: aba engasgada/throttled parava de
+            # drenar, o write do relay bloqueava sem timeout, a gente parava de
+            # ler do cliente e o listener (single-thread) congelava junto
+            self.connection.settimeout(30)
             chunked = b"transfer-encoding: chunked" in cab.lower()
             sobra = resto
             while True:

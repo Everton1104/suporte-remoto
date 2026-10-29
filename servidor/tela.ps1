@@ -157,16 +157,24 @@ $ultimoQuadro = Get-Date
 $crlf = [byte[]](13, 10)
 $rodando = $true
 
+$script:quadros = 0
 function EscreveQuadro {
     try {
         $b = Capturar
         $cab = [Text.Encoding]::ASCII.GetBytes(
             "--frame`r`nContent-Type: image/jpeg`r`nContent-Length: $($b.Length)`r`n`r`n")
-        $tela.Response.OutputStream.Write($cab, 0, $cab.Length)
-        $tela.Response.OutputStream.Write($b, 0, $b.Length)
-        $tela.Response.OutputStream.Write($crlf, 0, 2)
-        $tela.Response.OutputStream.Flush()
+        # Write com timeout: se o viewer parar de drenar (aba do navegador em
+        # background/engasgada), o Write sincrono bloqueava PARA SEME a unica
+        # thread daqui — quadros E entrada morriam juntos ("travou"). 3s sem
+        # drenar = viewer morto: Abort e libera o loop (a pagina reconecta).
+        $out = $tela.Response.OutputStream
+        $ok = $out.WriteAsync($cab, 0, $cab.Length).Wait(3000)
+        if ($ok) { $ok = $out.WriteAsync($b, 0, $b.Length).Wait(3000) }
+        if ($ok) { $ok = $out.WriteAsync($crlf, 0, 2).Wait(3000) }
+        if (-not $ok) { throw "viewer nao drena o stream (write 3s)" }
+        $out.Flush()
         $script:ultimoQuadro = Get-Date
+        $script:quadros++
     } catch {
         Log "viewer desconectou ($($_.Exception.Message))"
         # Abort, nao Close: Close da flush nos headers 200 pendentes e termina
@@ -178,8 +186,15 @@ function EscreveQuadro {
 }
 
 $inicio = Get-Date
+$ultimoBat = Get-Date
 while ($rodando -and $escuta.IsListening) {
     if (((Get-Date) - $inicio).TotalMinutes -ge $SessaoMaxMin) { Log "fim: sessao maxima"; break }
+    # heartbeat no log: se "travar" de novo, o log mostra se o loop morreu
+    # (linhas param) ou seguiu vivo (quadros continuam contando)
+    if (((Get-Date) - $ultimoBat).TotalSeconds -ge 60) {
+        Log "vivo quadros=$($script:quadros) viewer=$($null -ne $tela)"
+        $ultimoBat = Get-Date
+    }
     $task = $escuta.GetContextAsync()
     while (-not $task.Wait(150)) {
         if (-not $rodando) { break }
@@ -231,7 +246,10 @@ while ($rodando -and $escuta.IsListening) {
             $leitor = New-Object IO.StreamReader($ctx.Request.InputStream,
                                                  [Text.Encoding]::UTF8)
             $ev = $leitor.ReadToEnd() | ConvertFrom-Json
-            if ($ev) { Injetar $ev }
+            if ($ev) {
+                if ($ev.t -ne 'move') { Log "in t=$($ev.t) b=$($ev.b) k=$($ev.k) c=$($ev.c)" }
+                Injetar $ev
+            }
             $ultimoViewer = Get-Date
             $ctx.Response.StatusCode = 204
             $ctx.Response.Close()
