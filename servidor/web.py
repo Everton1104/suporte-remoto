@@ -1540,6 +1540,9 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             print("tela: stream encerrou (cid=%s): %s" % (cid, exc), flush=True)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            # o motivo tem que ir pro log tambem: 502 sem texto no log forcava
+            # reproduzir subir na mao pra descobrir o que houve (caso dell)
+            print("tela: 502 (cid=%s): %s" % (cid, exc), flush=True)
             self._erro(502, "tela falhou: %s" % exc)
         finally:
             if sock:
