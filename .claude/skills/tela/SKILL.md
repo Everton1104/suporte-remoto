@@ -65,6 +65,21 @@ Sintoma: página do tela em "carregando" pra sempre, log do web.py com
    5 min (handler travado segurando `ativos>0` respondia 409 pra
    todo mundo).
 
+## Travamento em uso (lição de campo, 29/10/2026)
+
+Controle funciona e depois de um tempo congela tudo. Três buracos, todos
+fechados (35fc183): (1) o `OutputStream.Write` do tela.ps1 bloqueava **para
+sempre** quando o viewer parava de drenar (aba do navegador throttled) —
+e como o servidor é single-thread, **frames e entrada morriam juntos**;
+agora escreve via `WriteAsync(...).Wait(3000)` → sem drenar = Abort e a
+página reconecta; (2) o relay do web.py escrevia pro navegador sem teto
+(agora `settimeout(30)`); (3) um evento perdido em silêncio (204 falso ou
+fetch falho engolido) deixava **botão embaixado** no cliente — tudo
+parecia morto; agora `/painel/tela/in` responde 504 sem confirmação e a
+fila da página repõe o evento. Diagnóstico: o tela.ps1 loga inputs
+(não-move) e um heartbeat/minuto (`vivo quadros=N`) — **log parado no
+travamento = loop congelado; log andando = problema no caminho**.
+
 ## Limitações conhecidas
 
 - ~2–4 fps (captura + JPEG em PowerShell) — cliques chegam com atraso
