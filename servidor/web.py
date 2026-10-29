@@ -1016,6 +1016,7 @@ PAGINA_TELA = """<!doctype html><meta charset=utf-8>
  #ctl{background:#26304a;color:#fff}
  #ctl.on{background:#a33;color:#fff;font-weight:600}
  #parar{background:#8a2626;color:#fff}
+ #voltar{background:#232a3a;color:#9ab}
  #palco{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;
         position:relative;overflow:hidden}
  #tela{max-width:100%;max-height:100%;user-select:none;-webkit-user-drag:none}
@@ -1026,6 +1027,7 @@ PAGINA_TELA = """<!doctype html><meta charset=utf-8>
  #dica{font-size:11px;color:#667;padding:6px 12px;text-align:center}
 </style>
 <div id=barra>
+ <button id=voltar title="voltar pra lista de PCs">← PCs</button>
  <span class=id>tela — __CID__</span>
  <span id=st>conectando…</span>
  <span style="flex:1"></span>
@@ -1074,8 +1076,10 @@ function novaConexao(){
   return '/painel/tela/stream?cid='+encodeURIComponent(cid)+'&r='+rede;
 }
 img.onload=()=>{ st.textContent='ao vivo'; st.className=''; };
+// stream que morre depois de vivo (janitor/cliente caiu) → volta pra lista
 img.onerror=()=>{ if(Date.now()-rede>15000){
-  st.textContent='stream caiu — recarregue a página'; st.className='err'; } };
+  st.textContent='stream encerrado — voltando pra lista…'; st.className='err';
+  setTimeout(()=>location.href='/painel',2000); } };
 img.src=novaConexao();
 
 // ---- entrada: coordenadas normalizadas (0..1) casam com o desktop
@@ -1148,11 +1152,13 @@ ctl.onclick=()=>{
     dica.textContent='assistindo — controle desligado';
   }
 };
+document.getElementById('voltar').onclick=()=>location.href='/painel';
 document.getElementById('parar').onclick=async()=>{
   await fetch('/painel/tela/parar',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({cid:cid})});
-  st.textContent='encerrado'; st.className='err'; img.removeAttribute('src');
+  st.textContent='encerrado — voltando…'; st.className='err'; img.removeAttribute('src');
+  setTimeout(()=>location.href='/painel',700);
 };
 </script>"""
 
