@@ -31,6 +31,14 @@ if (Test-Path $ak) {
 Remove-Item "$env:SystemRoot\System32\suporte-mensagem.cmd", "$env:SystemRoot\System32\suporte-pergunta.cmd", "$env:SystemRoot\System32\suporte-pergunta-run.ps1" -Force
 Remove-Item "$env:PUBLIC\suporte-pergunta-ui.ps1", "$env:PUBLIC\suporte-resposta.txt" -Force
 schtasks /delete /tn SuporteRemotoPergunta /f
+# tela do tecnico: tarefa, processo, arquivos e a exclusao do Defender que
+# o tela.sh cria ao subir a tela (autorizada pelo tecnico, dono da frota)
+schtasks /delete /tn SuporteRemotoTela /f
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+    Where-Object { $_.CommandLine -like '*suporte-tela.ps1*' -and $_.ProcessId -ne $PID } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Remove-Item "$env:PUBLIC\suporte-tela.ps1", "$env:PUBLIC\suporte-tela.log" -Force
+Remove-MpPreference -ExclusionPath "$env:PUBLIC\suporte-tela.ps1"
 Write-Host 'Removendo arquivos...'
 Set-Location $env:SystemRoot
 # este script roda DESTE diretorio e o powershell segura o proprio .ps1 -

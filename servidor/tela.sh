@@ -29,10 +29,18 @@ case "$ACAO" in
 subir)
     # mata instancia anterior (tarefa de sessao passada pode ter deixado
     # powershell vivo segurando a porta) e sobe o .ps1 na sessao logada:
-    # captura/injecao SO funcionam fora da sessao 0
+    # captura/injecao SO funcionam fora da sessao 0. /ru Interactive roda
+    # COMO o usuario logado na tela (usuario do tunel costuma ser outro —
+    # sem isso a tarefa /it nunca dispara); fallback sem /ru se o sistema
+    # recusar. -ne $PID: o kill abaixo casaria com ESTA sessao (a linha de
+    # comando contem 'suporte-tela.ps1') e se mataria (exit 255 silencioso).
+    # Add-MpPreference: o AMSI do Defender barra o script (captura+HTTP =
+    # assinatura de spyware de tela, mesmo sem injecao) — exclusao deste
+    # arquivo, autorizada pelo tecnico (dono da frota) em 29/10; em AV nao
+    # Defender o cmdlet nao existe e o erro e engolido
     scp -q -P "$PORTA" -i "$CHAVE" $KHOST \
         "$BASE/tela.ps1" "$USUARIO@localhost:C:/Users/Public/suporte-tela.ps1"
-    $ATENDER -c "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object {\$_.CommandLine -like '*suporte-tela.ps1*'} | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force } >\$null 2>&1; schtasks /create /tn SuporteRemotoTela /tr \"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Users\Public\suporte-tela.ps1\" /sc once /st 23:59 /it /f >\$null 2>&1; schtasks /run /tn SuporteRemotoTela" >/dev/null
+    $ATENDER -c "Add-MpPreference -ExclusionPath 'C:\Users\Public\suporte-tela.ps1' >\$null 2>&1; Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object {\$_.CommandLine -like '*suporte-tela.ps1*' -and \$_.ProcessId -ne \$PID} | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force } >\$null 2>&1; \$tr = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Users\Public\suporte-tela.ps1'; schtasks /create /tn SuporteRemotoTela /tr \$tr /sc once /st 23:59 /it /ru Interactive /f >\$null 2>&1; if (\$LASTEXITCODE -ne 0) { schtasks /create /tn SuporteRemotoTela /tr \$tr /sc once /st 23:59 /it /f >\$null 2>&1 }; schtasks /run /tn SuporteRemotoTela" >/dev/null
 
     # encaminhamento persistente: porta local do servidor -> listener no
     # cliente (localhost:28090 — o Host tem que bater com o prefixo do
@@ -42,9 +50,11 @@ subir)
         >/dev/null 2>&1 &
     echo $! > "$PIDF"
 
-    # espera o encaminhamento abrir (schtasks /it demora uns segundos)
+    # espera o LISTENER responder (probe HTTP de verdade: o socket do ssh -L
+    # aceita conexao mesmo com o cliente la atras morto — falso positivo)
     for _ in $(seq 40); do
-        if (echo > /dev/tcp/127.0.0.1/"$PORTA_LOCAL") 2>/dev/null; then
+        if curl -s -m 2 -H 'Host: localhost:28090' \
+                "http://127.0.0.1:$PORTA_LOCAL/info" >/dev/null 2>&1; then
             echo "tela no ar: 127.0.0.1:$PORTA_LOCAL (cid=$ID)"
             exit 0
         fi
@@ -62,7 +72,7 @@ parar)
     [ -f "$PIDF" ] && { kill "$(cat "$PIDF")" 2>/dev/null || true; rm -f "$PIDF"; }
     pkill -f -- "-L 127.0.0.1:${PORTA_LOCAL}:localhost:28090" 2>/dev/null || true
     # higiene no cliente: tarefa, processo e arquivos
-    $ATENDER -c "schtasks /delete /tn SuporteRemotoTela /f >\$null 2>&1; Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object {\$_.CommandLine -like '*suporte-tela.ps1*'} | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force } >\$null 2>&1; Remove-Item C:\Users\Public\suporte-tela.ps1, C:\Users\Public\suporte-tela.log -ErrorAction SilentlyContinue" >/dev/null 2>&1 || true
+    $ATENDER -c "schtasks /delete /tn SuporteRemotoTela /f >\$null 2>&1; Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object {\$_.CommandLine -like '*suporte-tela.ps1*' -and \$_.ProcessId -ne \$PID} | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force } >\$null 2>&1; Remove-Item C:\Users\Public\suporte-tela.ps1, C:\Users\Public\suporte-tela.log -ErrorAction SilentlyContinue" >/dev/null 2>&1 || true
     echo "tela encerrada (cid=$ID)"
     ;;
 

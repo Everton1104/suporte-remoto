@@ -19,6 +19,28 @@ funcionam fora da sessão 0.
   listener 45s depois e o `tela.ps1` se autolimita: 30 min de sessão,
   10 min sem viewer.
 
+## Antivírus (lição de campo, 29/10/2026)
+
+O **AMSI do Windows Defender bloqueia o tela.ps1 no parse** — captura de
+tela + servidor HTTP já é assinatura de spyware de tela (a versão
+só-visual também cai; o exit é 1 **sem escrever o log**). Por decisão do
+técnico (dono da frota), o `tela.sh subir` adiciona
+`Add-MpPreference -ExclusionPath C:\Users\Public\suporte-tela.ps1`
+(cirúrgica: só este arquivo; reversível; o desinstalador do agente
+remove). **Nunca tentar burlar o AMSI** — técnica de malware; a exclusão
+transparente é o caminho legítimo. Em AV não-Defender o cmdlet não existe
+e o erro é engolido (a tela pode não subir — investigar caso a caso).
+
+Outras pegadinhas já embutidas no tela.sh: `/ru Interactive` **não
+resolve SID** nas máquinas adjundiai (erro "mapeamento entre nomes de
+conta e SIDs" → fallback para `/it` puro, que funciona porque o usuário
+do túnel é o logado; se forem usuários diferentes a UI não sobe); o kill
+de powershells precisa da guarda `-ne $PID` (a linha de comando da própria
+sessão contém 'suporte-tela.ps1' — sem a guarda ela se mata: exit 255
+silencioso); e o probe de "tela no ar" é um GET `/info` HTTP (o socket do
+`ssh -L` aceita conexão mesmo com o listener morto no cliente — probe de
+TCP puro dá falso positivo).
+
 ## Limitações conhecidas
 
 - ~2–4 fps (captura + JPEG em PowerShell) — cliques chegam com atraso
