@@ -1,1 +1,5 @@
-{"cloudflared": "2026.10.5", "openssh": "10.4.0.0p1-Preview"}
+{
+ "cloudflared": "2026.10.6",
+ "openssh": "10.4.0.0p1-Preview",
+ "curl": "8.23.0_6"
+}

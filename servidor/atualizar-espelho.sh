@@ -58,5 +58,5 @@ print("versoes.json:", versoes)
 PY
 
 echo
-echo "Espelho atualizado. Para limpar o aviso do painel, clique em"
-echo "'procurar atualização' (a checagem automática também roda a cada 6h)."
+echo "Espelho atualizado. Rodando pelo painel (botão 'atualizar agora') o aviso"
+echo "sai sozinho; pelo terminal, clique em 'procurar atualização' para limpar."

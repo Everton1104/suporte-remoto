@@ -24,6 +24,9 @@ Rotas do técnico:
   GET  /painel/tela/stream?cid= -> relay do stream do tela.ps1 (túnel reverso)
   POST /painel/tela/in     -> evento de mouse/teclado (controle remoto)
   POST /painel/tela/parar  -> derruba listener no cliente + ssh -L
+  POST /painel/verificar   -> reconsulta o GitHub na hora (alimenta o aviso)
+  POST /painel/atualizar   -> roda atualizar-espelho.sh em background; o
+                              progresso aparece no banner (poll de 5s do painel)
   GET  /xterm.js /xterm.css /xterm-fit.js -> assets do terminal (servidor/static)
 
 Credenciais em servidor/clientes.json (reg.login, senha PBKDF2); o token_painel
@@ -100,6 +103,11 @@ ARQUIVOS_MIRROR = {   # rota /arquivos/<nome> -> content-type (whitelist fechada
 }
 ATUALIZACOES = {}     # nome -> {"espelho","atual"} quando o GitHub tem versão nova
 CHECAGEM = {"quando": 0.0, "erro": ""}
+# botão "atualizar agora" do aviso: roda atualizar-espelho.sh em background e
+# o rabo do log alimenta o banner do painel (o /painel/dados já roda a cada 5s)
+ATUALIZAR = {"rodando": False, "ok": None, "fim": 0.0}
+ARQ_ATUALIZAR_LOG = os.path.join(BASE, ".atualizar-espelho.log")
+_ATUALIZAR_LOCK = threading.Lock()
 
 
 def agora():
@@ -377,6 +385,42 @@ def _thread_atualizacoes():
         time.sleep(6 * 3600)
 
 
+def _rabo_atualizar():
+    """Últimas linhas do log da atualização em curso (banner do painel)."""
+    try:
+        with open(ARQ_ATUALIZAR_LOG, errors="replace") as f:
+            return [l for l in f.read().splitlines() if l.strip()][-6:]
+    except OSError:
+        return []
+
+
+def _atualizar_espelho():
+    """Roda atualizar-espelho.sh pelo botão do painel; log vai para o banner."""
+    with open(ARQ_ATUALIZAR_LOG, "w") as log:
+        try:
+            # grupo próprio de processos: no timeout o killPG mata o curl
+            # junto (um curl órfão disputaria os .tmp com a rodada seguinte)
+            p = subprocess.Popen(["bash", os.path.join(BASE, "atualizar-espelho.sh")],
+                                 stdout=log, stderr=subprocess.STDOUT,
+                                 cwd=BASE, start_new_session=True)
+            try:
+                ATUALIZAR["ok"] = p.wait(timeout=1800) == 0
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError:
+                    p.kill()
+                p.wait()
+                log.write("== 30min e não terminou — processo morto ==\n")
+                ATUALIZAR["ok"] = False
+        except Exception as exc:      # bash sumiu, disco cheio...
+            log.write("disparar o script falhou: %s\n" % exc)
+            ATUALIZAR["ok"] = False
+    ATUALIZAR["fim"] = time.time()
+    ATUALIZAR["rodando"] = False
+    checar_atualizacoes()             # renova (ou limpa) o aviso com o espelho novo
+
+
 def dados_painel():
     reg = carregar()
     agora_ = datetime.now()
@@ -400,6 +444,12 @@ def dados_painel():
     return {"clientes": out, "versoes": {
         "espelho": _ler_versoes(), "atualizacoes": ATUALIZACOES,
         "quando": CHECAGEM["quando"], "erro": CHECAGEM["erro"],
+        # estado do botão "atualizar agora": idade calculada AQUI porque o
+        # relógio do celular que abre o painel não é o do servidor
+        "atualizando": dict(ATUALIZAR,
+                            idade=(time.time() - ATUALIZAR["fim"]
+                                   if ATUALIZAR["fim"] else None),
+                            log=_rabo_atualizar()),
     }}
 
 
@@ -760,6 +810,9 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
  @keyframes pisca{0%,60%,100%{opacity:0}30%{opacity:1}}
  .aviso{background:#411;border:1px solid #933;border-radius:4px;padding:8px 12px;
         font-size:13px;margin:0 0 10px;overflow-wrap:anywhere}
+ .aviso.baixando{background:#132a3f;border-color:#38618c}
+ .aviso.ok{background:#142;border-color:#2c8}
+ .aviso button{vertical-align:middle;margin-left:6px}
  .aviso code{overflow-wrap:anywhere}
  .vermsg{color:#777;font-size:12px;margin-left:8px}
  /* celular: cada cliente vira um cartão — tabela de 9 colunas não cabe */
@@ -849,13 +902,40 @@ async function carregar(){
   versoes(d);
 }
 function versoes(d){
-  const a=(d.versoes||{}).atualizacoes||{}, el=document.getElementById('aviso');
-  const nomes=Object.keys(a);
+  const v=d.versoes||{}, a=v.atualizacoes||{}, upd=v.atualizando||{},
+        el=document.getElementById('aviso'), nomes=Object.keys(a);
+  el.className='aviso';
+  const log=(upd.log||[]).filter(Boolean);
+  if(upd.rodando){
+    el.classList.add('baixando');
+    el.innerHTML='⬇ baixando das fontes e regravando o espelho — '
+      +esc(log[log.length-1]||'iniciando...')
+      +'<span class=pontos><i>.</i><i>.</i><i>.</i></span>'
+      +'<br><small>não feche a página — o banner sai sozinho quando terminar</small>';
+    el.style.display='block'; return;
+  }
+  if(upd.ok===true && upd.idade!=null && upd.idade<60){
+    el.classList.add('ok');
+    el.innerHTML='✔ espelho atualizado'; el.style.display='block'; return;
+  }
   if(!nomes.length){ el.style.display='none'; return; }
   el.innerHTML='⚠ atualização disponível: '+nomes.map(k=>
     esc(k+' '+a[k].espelho+' → '+a[k].atual)).join(' · ')
-   +' — rode <code>servidor/atualizar-espelho.sh</code> no servidor';
+   +(upd.ok===false?' — <b>última tentativa falhou:</b> '
+     +esc(log.slice(-2).join(' | ')):'')
+   +' <button class=conectar onclick=atualizarAgora()>'
+   +(upd.ok===false?'tentar de novo':'atualizar agora')+'</button>';
   el.style.display='block';
+}
+async function atualizarAgora(){
+  const m=document.getElementById('vermsg'); m.textContent='disparando...';
+  try{
+    const r=await fetch('/painel/atualizar',{method:'POST'});
+    if(!r.ok) throw 0;
+    m.textContent=(await r.json()).iniciado
+      ?'baixando — o banner mostra o progresso':'já estava rodando';
+  }catch(e){ m.textContent='falhou — sessão expirada?'; }
+  carregar();
 }
 async function verificar(){
   const m=document.getElementById('vermsg'); m.textContent='consultando GitHub...';
@@ -1410,6 +1490,18 @@ class Handler(BaseHTTPRequestHandler):
                 raise PermissionError("sem sessão")
             checar_atualizacoes()
             self._json({"atualizacoes": ATUALIZACOES, "erro": CHECAGEM["erro"]})
+        elif rota == "/painel/atualizar":
+            # botão "atualizar agora" do aviso: baixa das fontes e regrava o
+            # espelho em background — o banner acompanha pelo /painel/dados
+            if not self._sessao():
+                raise PermissionError("sem sessão")
+            with _ATUALIZAR_LOCK:
+                ja = ATUALIZAR["rodando"]
+                if not ja:
+                    ATUALIZAR.update(rodando=True, ok=None, fim=0.0)
+            if not ja:
+                threading.Thread(target=_atualizar_espelho, daemon=True).start()
+            self._json({"iniciado": not ja})
         else:
             qs = parse_qs(urlsplit(self.path).query)
             if rota == "/painel/term/in":

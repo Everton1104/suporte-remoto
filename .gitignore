@@ -3,6 +3,7 @@ servidor/clientes.json
 servidor/clientes/
 servidor/sessoes/
 servidor/.sessoes.json
+servidor/.atualizar-espelho.log
 suporte-2026*.sh
 
 # binários espelhados em servidor/static (centenas de MB;
