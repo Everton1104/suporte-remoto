@@ -799,6 +799,8 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
  .term:disabled{background:#1d2333;color:#556;cursor:not-allowed}
  .telab{background:#2c6e49;color:#fff;border:0;border-radius:4px}
  .telab:disabled{background:#1d2333;color:#556;cursor:not-allowed}
+ .claub{background:#a15c3f;color:#fff;border:0;border-radius:4px}
+ .claub:disabled{background:#1d2333;color:#556;cursor:not-allowed}
  .conectar{background:#2c8;color:#041;border:0;border-radius:4px;font-weight:600}
  .conectar:disabled{background:#283528;color:#577;cursor:not-allowed;font-weight:400}
  .encerrar{background:#c33;color:#fff;border:0;border-radius:4px;font-weight:600}
@@ -842,6 +844,9 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
   td:last-child button:nth-child(2){grid-column:1/-1;order:2}
   td:last-child button:nth-child(3){order:-1}
   td:last-child button:nth-child(4){order:-1}
+  /* claude: linha inteira entre o par terminal/tela e o remover (order
+     distinto — empate quebra por ordem do DOM) */
+  td:last-child button:nth-child(5){grid-column:1/-1}
  }
 </style>
 <h2>Clientes instalados <a class=sair href=/painel/sair>sair</a></h2>
@@ -897,6 +902,9 @@ async function carregar(){
       <button class=telab ${(c.tunel&&c.online)
         ? `onclick="location.href='/painel/tela?cid=${esc(c.id)}'"`
         : `disabled title="${semTunel}"`}>tela</button>
+      <button class=claub ${(c.tunel&&c.online)
+        ? `onclick="location.href='/painel/term?cid=${esc(c.id)}&claude=1'"`
+        : `disabled title="${semTunel}"`}>claude</button>
     </td>
    </tr>`}).join('') || '<tr><td colspan=8 class=off>nenhum cliente instalado ainda</td></tr>';
   versoes(d);
