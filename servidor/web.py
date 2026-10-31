@@ -1063,11 +1063,35 @@ document.getElementById('escbtn').addEventListener('click',()=>{fila.push('\\x1b
 term.onResize(({cols,rows})=>fetch('/painel/term/size?s='+s+'&cid='+encodeURIComponent(cid),
   {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cols,rows})}));
 window.addEventListener('resize',()=>fit.fit());
-// teclado virtual (Android/iOS): o xterm não ganha foco sozinho — todo toque
-// na área do terminal foca e abre o teclado
+// teclado virtual (Android/iOS): o xterm não ganha foco sozinho — um toque
+// PARADO na área do terminal foca e abre o teclado (arrasto é scroll, não foco)
 const focar=()=>term.focus();
 document.getElementById('t').addEventListener('click',focar);
-document.getElementById('t').addEventListener('touchend',e=>{e.preventDefault();focar();});
+let tArr=0;
+document.getElementById('t').addEventListener('touchend',e=>{
+  if(tArr>12) return;
+  e.preventDefault();focar();
+});
+// TUI de tela cheia (claude): ela liga o alternate screen e captura o mouse —
+// no xterm não existe scrollback ali e o TOQUE não vira evento de roda pro
+// aplicativo (só a roda do mouse vira). O arrasto do dedo é traduzido aqui em
+// rodadas SGR (64=sobe, 65=desce), mesmo protocolo que a roda usa lá em cima
+let tY=0,tAc=0;
+document.getElementById('t').addEventListener('touchstart',e=>{
+  tY=e.touches[0].clientY;tAc=0;tArr=0;},{passive:true});
+document.getElementById('t').addEventListener('touchmove',e=>{
+  if(term.buffer.active.type!=='alternate') return;  // buffer normal: xterm rola
+  e.preventDefault();
+  const y=e.touches[0].clientY;tAc+=tY-y;tArr+=Math.abs(tY-y);tY=y;
+  const col=Math.max(1,term.cols>>1),lin=Math.max(1,term.rows>>1),passo=48;
+  let rodas='';
+  while(Math.abs(tAc)>=passo){
+    const b=tAc>0?64:65;
+    tAc+=tAc>0?-passo:passo;
+    rodas+='\\x1b[<'+b+';'+col+';'+lin+'M\\x1b[<'+b+';'+col+';'+lin+'m';
+  }
+  if(rodas){fila.push(rodas);bombear();}
+},{passive:false});
 // F5/aba fechada: shell morre com a aba; claude FICA VIVO no servidor
 // (reatanexável — igual sessão do code-server), o janitor colhe depois
 addEventListener('pagehide',()=>{
