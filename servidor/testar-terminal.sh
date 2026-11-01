@@ -10,7 +10,23 @@ URL=${URL:-http://127.0.0.1:8090}
 AK=/root/.ssh/authorized_keys
 WORK=$(mktemp -d /tmp/teste-terminal.XXXXXX)
 
-falhar() { echo "FALHOU: $1"; limpar_tunel; [ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null; exit 1; }
+falhar() {
+  echo "FALHOU: $1"; limpar_tunel; [ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null
+  # higiene do fluxo de sucesso: falha no meio deixava cliente de teste no
+  # registro e pubkey de técnico no authorized_keys do root — que vale pro
+  # sshd publicado, não pode sobrar
+  if [ -n "${ID:-}" ] && [ -n "${TOKEN:-}" ]; then
+    for i in 1 2; do curl -fsS -X POST -H 'Content-Type: application/json' \
+      -d "{\"token\":\"$TOKEN\",\"id\":\"$ID\",\"acao\":\"remover\"}" \
+      "$URL/painel/acao" >/dev/null 2>&1; done
+  fi
+  [ -n "${PUBTEC:-}" ] && sed -i "\#${PUBTEC}#d" "$AK" 2>/dev/null
+  if [ -f "$AK.teste-terminal-bak" ]; then
+    grep -v 'cliente:' "$AK.teste-terminal-bak" > "$AK" 2>/dev/null || : > "$AK"
+    rm -f "$AK.teste-terminal-bak"
+  fi
+  rm -rf "$WORK" /tmp/ak-esperado; exit 1
+}
 porta_aberta() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 limpar_tunel() { [ -n "${TPID:-}" ] && kill "$TPID" 2>/dev/null; TPID=; }
 
@@ -67,8 +83,13 @@ wait "$SPID" 2>/dev/null
 
 # 6) desmonta tudo (encerrar + remover + higiene)
 limpar_tunel
-curl -fsS -X POST -H 'Content-Type: application/json' \
-    -d "{\"token\":\"$TOKEN\",\"id\":\"$ID\",\"acao\":\"remover\"}" "$URL/painel/acao" >/dev/null || falhar "remover"
+# 2 cliques: 1º pede auto-desinstalação (pendente — o "agente" de teste já
+# foi embora e nunca confirma), 2º força a revogação. Só o 1º deixava
+# cliente de teste no registro a cada rodada verde
+for i in 1 2; do curl -fsS -X POST -H 'Content-Type: application/json' \
+    -d "{\"token\":\"$TOKEN\",\"id\":\"$ID\",\"acao\":\"remover\"}" "$URL/painel/acao" >/dev/null || falhar "remover ($i)"; done
+python3 -c "import json,sys;sys.exit(0 if '$ID' not in json.load(open('$BASE/clientes.json'))['clientes'] else 1)" \
+  || falhar "cliente de teste ficou no registro"
 sed -i "\#${PUBTEC}#d" "$AK" 2>/dev/null
 if [ -f "$AK.teste-terminal-bak" ]; then
     grep -v 'cliente:' "$AK.teste-terminal-bak" > /tmp/ak-esperado 2>/dev/null || : > /tmp/ak-esperado

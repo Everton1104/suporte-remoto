@@ -18,6 +18,8 @@ Rotas do técnico:
                               (token ainda vale p/ API e testes; no navegador é a sessão)
   POST /painel/nome        -> {"id","nome"}: renomeia o cliente (coluna editável)
   GET  /painel/term?cid=   -> página do terminal xterm do cliente
+                              (cid=__operador__&claude=1 = claude OPERADOR:
+                              sessão que administra a frota no servidor)
   GET  /painel/term/stream?cid=&s= -> PTY do atender.sh, saída em stream até fechar
   POST /painel/term/in?s=  -> teclas (corpo cru) | size (cols/rows) | fechar
   GET  /painel/tela?cid=   -> página da tela ao vivo do cliente (MJPEG)
@@ -84,6 +86,31 @@ TERMINAL_IDLE_S = 30 * 60   # terminal sem tráfego por 30min é fechado
 CLAUDE_SESSOES = {}
 CLAUDE_BUF_MAX = 512 * 1024   # scrollback por sessão (reanexo mostra isto)
 _CLAUDE_CRIAR_LOCK = threading.Lock()
+# sessão claude do OPERADOR (botão "claude (servidor)"): administra a frota —
+# abre/fecha conexões a pedido, cria watchers, avisa o painel. Chave sintética
+# em CLAUDE_SESSOES: slug de cliente real é só [a-z0-9-], underscore não colide.
+OPERADOR_CID = "__operador__"
+OPERADOR_CTX = (
+    "Modo OPERADOR do suporte-remoto: voce administra ESTE servidor de suporte "
+    "(painel, clientes, conexoes) — nao uma maquina cliente especifica. O tecnico "
+    "pede no chat: abrir/fechar conexao de um cliente, atender/diagnosticar um "
+    "cliente, criar watcher (ex.: avisar quando um cliente ficar online). "
+    "Ferramentas no skill 'operar' deste projeto: bin/clientes (listar), "
+    "/painel/acao via curl com token de servidor/clientes.json (conectar e "
+    "encerrar), avisar.sh (banner no painel do tecnico), watch-online.sh "
+    "(watcher de online), bin/mensagem e bin/pergunta (popup pro usuario do "
+    "cliente, exigem tunel), atender.sh (comandos NA maquina do cliente, skill "
+    "'atender'). REGRAS: conectar/encerrar tunel SO quando o tecnico pedir — "
+    "nunca por iniciativa propria; REMOVER cliente e sempre o tecnico no painel, "
+    "nunca voce; operacao destrutiva ou irreversivel: confirme com o tecnico "
+    "ANTES; comandos de maquina de cliente rodam so via 'bash "
+    "servidor/atender.sh <cid> -c ...' — nunca no servidor onde voce roda; "
+    "watcher criado reporta pid e validade, e voce o mata se o tecnico "
+    "cancelar. Responda curto em portugues."
+)
+# avisos ao técnico (banner 🔔 do painel): linhas JSON anexadas por avisar.sh
+ARQ_AVISOS = os.path.join(BASE, "avisos.jsonl")
+AVISO_MAX = 20                 # quantos vão pro painel (últimos)
 # tela do cliente (MJPEG + controle): o listener vive no cliente (tela.ps1
 # sobe via schtasks /it na sessão logada) e chega até aqui por um ssh -L
 # que o tela.sh mantém. Aqui só registramos quem está olhando, pra derrubar
@@ -375,6 +402,35 @@ def checar_atualizacoes():
         else:
             ATUALIZACOES.pop(nome, None)
 
+    # .deb da tela Linux: HEAD no índice Packages da suite (zero bytes de
+    # tráfego) — Last-Modified diferente do gravado no espelho = o
+    # repositório Debian mudou e os .deb de static/deb/ podem estar velhos.
+    # A resposta de qualquer mudança (não só do python3-pil) é o botão do
+    # painel re-baixar (barato, ~2 MB) — sem parse frágil de versão.
+    for suite in ("trixie", "bookworm"):
+        nome = "deb-" + suite
+        arq_lm = os.path.join(BASE, "static", "deb", suite + "-amd64", "indice-lm")
+        try:
+            with open(arq_lm) as f:
+                lm_espelho = f.read().strip()
+        except OSError:
+            continue            # espelho ainda sem .deb desta suite
+        try:
+            req = urllib.request.Request(
+                "https://deb.debian.org/debian/dists/%s/main/"
+                "binary-amd64/Packages.gz" % suite,
+                headers={"User-Agent": "suporte-remoto"}, method="HEAD")
+            with urllib.request.urlopen(req, timeout=15) as r:
+                lm_atual = r.headers.get("Last-Modified") or ""
+        except Exception as exc:
+            CHECAGEM["erro"] = "%s: %s" % (nome, exc)
+            continue
+        if lm_atual and lm_atual != lm_espelho:
+            ATUALIZACOES[nome] = {"espelho": espelho.get(nome) or "?",
+                                  "atual": "repositório Debian mudou"}
+        else:
+            ATUALIZACOES.pop(nome, None)
+
 
 def _thread_atualizacoes():
     while True:
@@ -441,7 +497,7 @@ def dados_painel():
     # (ordem serve ao painel web E à extensão do VSCode — ambas listam isso).
     # NÃO ordenar por último contato: ele muda a cada poll e os cards dançam.
     out.sort(key=lambda c: (not c["online"], (c["nome"] or "").lower(), c["id"]))
-    return {"clientes": out, "versoes": {
+    return {"clientes": out, "avisos": _ler_avisos(), "versoes": {
         "espelho": _ler_versoes(), "atualizacoes": ATUALIZACOES,
         "quando": CHECAGEM["quando"], "erro": CHECAGEM["erro"],
         # estado do botão "atualizar agora": idade calculada AQUI porque o
@@ -462,17 +518,48 @@ def tunel_aberto(porta):
         return False
 
 
+def _ler_avisos():
+    """Avisos do técnico (avisar.sh anexa JSON por linha, utf-8). Cresce
+    devagar; passa de 400 linhas = poda para as últimas 150 no mesmo formato
+    (o append concorrente perde no máximo 1 aviso na janela do replace)."""
+    try:
+        with open(ARQ_AVISOS, encoding="utf-8") as f:
+            linhas = f.read().splitlines()
+    except OSError:
+        return []
+    if len(linhas) > 400:
+        try:
+            tmp = ARQ_AVISOS + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(linhas[-150:]) + "\n")
+            os.replace(tmp, ARQ_AVISOS)
+            linhas = linhas[-150:]
+        except OSError:
+            pass
+    out = []
+    for l in linhas:
+        try:
+            a = json.loads(l)
+        except ValueError:
+            continue
+        if a.get("texto"):
+            out.append({"quando": str(a.get("quando") or ""), "texto": str(a["texto"])[:300]})
+    return out[-AVISO_MAX:]
+
+
 # ---------------- terminal web (xterm) ----------------
 
 def abrir_terminal(cid, claude=False, sess=None, retomar=False):
     """Abre um PTY: atender.sh <cid> (shell do cliente no navegador) ou, em
     modo claude, o Claude Code do próprio servidor — que alcança o cliente
     pelo túnel reverso via skill /atender, como se morasse na máquina dele.
-    Com sess (uuid do sessionStorage da página): primeira abertura fixa o id
-    da conversa (--session-id) e o reload retoma (--resume) — a conversa
-    sobrevive ao F5 porque o CLI persiste o histórico em disco."""
+    cid=OPERADOR_CID nasce no modo operador: a frota inteira no system prompt
+    (skill 'operar'). Com sess (uuid do sessionStorage da página): primeira
+    abertura fixa o id da conversa (--session-id) e o reload retoma
+    (--resume) — a conversa sobrevive ao F5 porque o CLI persiste o
+    histórico em disco."""
     reg = carregar()
-    if cid not in reg["clientes"]:
+    if cid != OPERADOR_CID and cid not in reg["clientes"]:
         raise KeyError("cliente desconhecido: %s" % cid)
     if len(TERMINAIS) + len(CLAUDE_SESSOES) >= TERMINAL_MAX:
         raise ValueError("já há %d terminais abertos — feche algum" % TERMINAL_MAX)
@@ -484,9 +571,6 @@ def abrir_terminal(cid, claude=False, sess=None, retomar=False):
                 # roda no diretório do projeto: herda skills e CLAUDE.md,
                 # que ensinam a operar o cliente (o túnel é reverso — o
                 # Claude nunca precisa estar instalado no PC do cliente).
-                # Nasce EM modo atendimento: cliente no system prompt, o
-                # técnico chega digitando só o problema
-                c = reg["clientes"][cid]
                 args = ["claude"]
                 if sess and all(ch in "0123456789abcdefABCDEF-" for ch in sess):
                     # uuid válido: fixa ou retoma a conversa (validação à mão:
@@ -501,21 +585,27 @@ def abrir_terminal(cid, claude=False, sess=None, retomar=False):
                             else ["--session-id", sess]
                     else:
                         args += ["--session-id", sess]
-                ctx = ("Modo ATENDIMENTO. Cliente: %s (%s, %s, usuario %s), tunel "
-                       "reverso na porta %d do localhost. Opere a maquina pelo skill "
-                       "'atender' deste projeto (probe do tunel antes de tudo; comandos "
-                       "por atender.sh -c). REGRA DE OURO: todo comando de maquina (disco, "
-                       "processo, rede, arquivo, servico) roda NO CLIENTE via "
-                       "'bash servidor/atender.sh %s -c ...' — NUNCA no servidor local "
-                       "onde voce roda; shell local so para os helpers do skill atender "
-                       "(probe da porta, /painel/acao, logs /var/log/svc). ABRIR tunel "
-                       "so com autorizacao do tecnico; FECHAR tunel e sempre do "
-                       "tecnico, no painel — nunca execute 'encerrar' voce mesmo. "
-                       "Operacao destrutiva ou irreversivel (remover, parar servico, "
-                       "reiniciar): confirme com o tecnico no chat ANTES. Nao faca "
-                       "nada ate o tecnico pedir; responda curto em portugues."
-                       % (cid, c.get("nome") or cid, c.get("so") or "?",
-                          c.get("usuario") or "?", c["porta"], cid))
+                if cid == OPERADOR_CID:
+                    ctx = OPERADOR_CTX
+                else:
+                    # modo ATENDIMENTO: cliente no system prompt, o técnico
+                    # chega digitando só o problema
+                    c = reg["clientes"][cid]
+                    ctx = ("Modo ATENDIMENTO. Cliente: %s (%s, %s, usuario %s), tunel "
+                           "reverso na porta %d do localhost. Opere a maquina pelo skill "
+                           "'atender' deste projeto (probe do tunel antes de tudo; comandos "
+                           "por atender.sh -c). REGRA DE OURO: todo comando de maquina (disco, "
+                           "processo, rede, arquivo, servico) roda NO CLIENTE via "
+                           "'bash servidor/atender.sh %s -c ...' — NUNCA no servidor local "
+                           "onde voce roda; shell local so para os helpers do skill atender "
+                           "(probe da porta, /painel/acao, logs /var/log/svc). ABRIR tunel "
+                           "so com autorizacao do tecnico; FECHAR tunel e sempre do "
+                           "tecnico, no painel — nunca execute 'encerrar' voce mesmo. "
+                           "Operacao destrutiva ou irreversivel (remover, parar servico, "
+                           "reiniciar): confirme com o tecnico no chat ANTES. Nao faca "
+                           "nada ate o tecnico pedir; responda curto em portugues."
+                           % (cid, c.get("nome") or cid, c.get("so") or "?",
+                              c.get("usuario") or "?", c["porta"], cid))
                 os.chdir(os.path.join(BASE, ".."))
                 os.execvp("claude", args + ["--append-system-prompt", ctx])
             os.execvp("bash", ["bash", os.path.join(BASE, "atender.sh"), cid])
@@ -801,6 +891,7 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
  .telab:disabled{background:#1d2333;color:#556;cursor:not-allowed}
  .claub{background:#a15c3f;color:#fff;border:0;border-radius:4px}
  .claub:disabled{background:#1d2333;color:#556;cursor:not-allowed}
+ .opb{background:#5a3c8c;color:#fff;border:0;border-radius:4px}
  .conectar{background:#2c8;color:#041;border:0;border-radius:4px;font-weight:600}
  .conectar:disabled{background:#283528;color:#577;cursor:not-allowed;font-weight:400}
  .encerrar{background:#c33;color:#fff;border:0;border-radius:4px;font-weight:600}
@@ -812,6 +903,7 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
  @keyframes pisca{0%,60%,100%{opacity:0}30%{opacity:1}}
  .aviso{background:#411;border:1px solid #933;border-radius:4px;padding:8px 12px;
         font-size:13px;margin:0 0 10px;overflow-wrap:anywhere}
+ .aviso.avisos{background:#43330e;border-color:#c93}
  .aviso.baixando{background:#132a3f;border-color:#38618c}
  .aviso.ok{background:#142;border-color:#2c8}
  .aviso button{vertical-align:middle;margin-left:6px}
@@ -850,9 +942,12 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
  }
 </style>
 <h2>Clientes instalados <a class=sair href=/painel/sair>sair</a></h2>
+<div id=avisos class="aviso avisos" style=display:none></div>
 <div id=aviso class=aviso style=display:none></div>
 <div style=margin-bottom:10px>
  <button class=term onclick=verificar()>procurar atualização</button>
+ <button class=opb title="claude operando O SERVIDOR: abre/fecha conexões, cria watchers… peça por lá"
+  onclick="location.href='/painel/term?cid=__operador__&amp;claude=1'">claude (servidor)</button>
  <span id=vermsg class=vermsg></span>
 </div>
 <table id=t><thead><tr>
@@ -908,6 +1003,32 @@ async function carregar(){
     </td>
    </tr>`}).join('') || '<tr><td colspan=8 class=off>nenhum cliente instalado ainda</td></tr>';
   versoes(d);
+  avisos(d);
+}
+// avisos do técnico (avisar.sh / watchers): banner 🔔 com os não vistos
+// deste navegador; "ok" marca o mais novo como visto (localStorage é local —
+// outro aparelho volta a vê-los, de propósito)
+const lsGet=k=>{try{return localStorage.getItem(k)}catch(e){return null}};
+const lsSet=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
+let pisca=0;
+function avisos(d){
+  const el=document.getElementById('avisos'), vistos=lsGet('aviso-visto')||'';
+  const novos=(d.avisos||[]).filter(a=>a.quando>vistos);
+  if(!novos.length){ el.style.display='none'; clearInterval(pisca); return; }
+  const ult=novos[novos.length-1];
+  el.innerHTML='🔔 '+novos.length+' aviso'+(novos.length>1?'s':'')
+   +novos.slice(-5).reverse().map(a=>'<br>'+esc(a.quando+' — '+a.texto)).join('')
+   +' <button class=conectar onclick=avisosOk(\\''+esc(ult.quando)+'\\')>ok</button>';
+  el.style.display='block';
+  clearInterval(pisca);
+  pisca=setInterval(()=>{              // aba em 2º plano: título chama
+    document.title=document.hidden&&document.title[0]!=='🔔'
+      ?'🔔 aviso no painel':'Suporte Remoto — clientes';
+  },1200);
+}
+function avisosOk(quando){
+  lsSet('aviso-visto',quando); clearInterval(pisca);
+  document.title='Suporte Remoto — clientes'; carregar();
 }
 function versoes(d){
   const v=d.versoes||{}, a=v.atualizacoes||{}, upd=v.atualizando||{},
@@ -1025,13 +1146,19 @@ if(modoClaude){
   sessionStorage.setItem(k,csess);
   retomar=prev?1:0;
 }
-document.getElementById('titulo').textContent=(modoClaude?'claude — ':'terminal — ')+cid;
+const operador=cid==='__operador__';
+document.getElementById('titulo').textContent=(modoClaude?'claude — ':'terminal — ')
+  +(operador?'servidor':cid);
 // botão de alternância: shell do cliente <--> claude (mesma página, recarrega
-// no outro modo — cada modo é um processo próprio no PTY)
+// no outro modo — cada modo é um processo próprio no PTY). Operador não tem
+// shell: a sessão claude dele mora no servidor, não num cliente
 const alt=document.getElementById('alt');
-alt.textContent=modoClaude?'shell':'claude';
-alt.onclick=()=>location.href='/painel/term?cid='+encodeURIComponent(cid)
-  +(modoClaude?'':'&claude=1');
+if(operador){ alt.style.display='none'; }
+else{
+  alt.textContent=modoClaude?'shell':'claude';
+  alt.onclick=()=>location.href='/painel/term?cid='+encodeURIComponent(cid)
+    +(modoClaude?'':'&claude=1');
+}
 const term=new Terminal({cursorBlink:true,fontSize:14,theme:{background:'#111'}});
 const fit=new FitAddon.FitAddon(); term.loadAddon(fit);
 term.open(document.getElementById('t')); fit.fit();
@@ -1406,15 +1533,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/painel")
                 return
             cid = (qs.get("cid") or [""])[0]
-            reg = carregar()
-            if cid not in reg["clientes"]:
-                self._erro(404, "cliente desconhecido")
-                return
             claude = (qs.get("claude") or [""])[0] == "1"
-            # PowerShell 5.1 manda acentos na codepage do sistema: força UTF-8 na ida.
-            # Só no modo shell — em modo claude o PTY é local e o setup digitaria
-            # comandos dentro do TUI
-            win = "windows" in (reg["clientes"][cid].get("so") or "").lower()
+            if cid == OPERADOR_CID:
+                # sessão claude do servidor (não de um cliente) — só existe
+                # em modo claude: "shell do servidor" por aqui não há
+                if not claude:
+                    self._erro(404, "operador é modo claude apenas (?claude=1)")
+                    return
+                win = False
+            else:
+                reg = carregar()
+                if cid not in reg["clientes"]:
+                    self._erro(404, "cliente desconhecido")
+                    return
+                # PowerShell 5.1 manda acentos na codepage do sistema: força UTF-8
+                # na ida. Só no modo shell — em modo claude o PTY é local e o
+                # setup digitaria comandos dentro do TUI
+                win = "windows" in (reg["clientes"][cid].get("so") or "").lower()
             setup = ""
             if win and not claude:
                 setup = ("setTimeout(()=>fetch('/painel/term/in?s='+s,{method:'POST',"

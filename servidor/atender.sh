@@ -51,13 +51,18 @@ if [ -n "$CMD" ]; then
 fi
 
 echo "== pré-voo: $MODO $ID -> $USUARIO@localhost:$PORTA_REVERSA =="
-# plataforma: "cmd /c echo %OS%" funciona no cmd E no PowerShell (que não
-# expande %OS% sozinho — e o DefaultShell do agente é PowerShell); no Linux
-# não existe cmd e devolve vazio
-PLATAFORMA=$(ssh "${OPTS[@]}" "$USUARIO@localhost" 'cmd /c echo %OS%' 2>/dev/null) || PLATAFORMA=
-if [ -z "$PLATAFORMA" ]; then
+# conectividade primeiro: 'echo ok' existe no cmd, no PowerShell e no sh.
+# O probe antigo ('cmd /c echo %OS%') também devolvia vazio em cliente LINUX
+# conectado (cmd não existe lá) — e o pré-voo mandava embora uma sessão boa
+# achando que o túnel tinha caído. \r à direita: PS manda CRLF
+PROBE=$(ssh "${OPTS[@]}" "$USUARIO@localhost" 'echo ok' 2>/dev/null) || PROBE=
+if [ "${PROBE%%$'\r'*}" != ok ]; then
     echo "!! não conectou — túnel ativo? agente conectado? painel em ordem?" >&2; exit 1
 fi
+# plataforma: "cmd /c echo %OS%" funciona no cmd E no PowerShell (que não
+# expande %OS% sozinho — e o DefaultShell do agente é PowerShell); no Linux
+# não existe cmd e devolve vazio — o que agora só significa "é Linux"
+PLATAFORMA=$(ssh "${OPTS[@]}" "$USUARIO@localhost" 'cmd /c echo %OS%' 2>/dev/null) || PLATAFORMA=
 if printf '%s' "$PLATAFORMA" | grep -q Windows_NT; then
     SO=Windows
     # elevação pelo nível de integridade do token: 12288 (High) = admin
