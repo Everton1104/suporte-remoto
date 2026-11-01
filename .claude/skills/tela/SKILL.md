@@ -6,8 +6,30 @@ description: Tela ao vivo do cliente no painel (MJPEG ~2-4 fps) com controle de 
 # Tela ao vivo + controle remoto
 
 Botão **tela** no painel (habilitado com túnel aberto + cliente online).
-Windows, exige **alguém logado na sessão** — captura e injeção só
-funcionam fora da sessão 0.
+**Windows** (`tela.ps1`): exige **alguém logado na sessão** — captura e
+injeção só funcionam fora da sessão 0. **Linux** (`tela-linux.py`): exige
+sessão gráfica **X11** (root acessa via Xauthority do display manager —
+lightdm/gdm/sddm autodetectado; **Wayland puro não funciona**, o log do
+cliente diz "sem acesso ao X11"). O `tela.sh` ramifica pelo campo `so` do
+clientes.json; protocolo HTTP e limites são idênticos dos dois lados.
+
+## Linux: encoder JPEG (31/10/2026)
+
+O `tela-linux.py` precisa de **python3-pil OU ffmpeg** no cliente para
+gerar JPEG. Se faltarem ambos, o `tela.sh subir` instala **.deb do espelho**
+(`static/deb/<suite>-amd64/`, baixados do pool do Debian pelo
+`atualizar-espelho.sh` — servidor é arm64, clientes amd64, por isso URL
+direta com sha256 do índice Packages): trixie e bookworm, só os pacotes
+ausentes, **sem rede no cliente**. Distro fora dessas suites → erro claro
+no 502 do painel (atualizar-espelho.sh --debs para cobrir a suite nova).
+A checagem de atualização do painel é um **HEAD no Packages.gz** da suite:
+Last-Modified mudou = aviso "deb-trixie/deb-bookworm: repositório Debian
+mudou" = botão re-baixa (~2 MB).
+
+Pegadinha já embutida: `pkill -f` da linha de lançamento — a própria linha
+ssh contém "suporte-tela.py" (no lançamento!); padrão **ancorado**
+`'^python3 /tmp/suporte-tela[.]py$'` casa só o processo. Scroll X11:
+d=+1→botão 5 (baixo), d=-1→botão 4 (cima).
 
 ## Regras
 
