@@ -127,6 +127,17 @@ ARQUIVOS_MIRROR = {   # rota /arquivos/<nome> -> content-type (whitelist fechada
     # nosso com certutil antes de qualquer outra coisa
     "curl.exe": "application/octet-stream",
     "curl-ca-bundle.crt": "application/octet-stream",
+    # modo WinPE (Hiren's BootCD): instalador que sobe o sshd portátil
+    # (renderizado por winpe/gerar-winpe.sh) + OpenSSH v9.5 estável
+    # (a v10 crasha em WinPE com "Received signal 8" — issue #1040)
+    "suporte-winpe.bat": "application/octet-stream",
+    "openssh-winpe-v95.zip": "application/zip",
+    # WinPE so-Chrome (Hiren's PE customizado; ver servidor/winpe/work/ e
+    # memoria winpe-chrome-custom.md). v1.0.9 (6/11): Chrome portatil do
+    # Everton (GoogleChromePortable 157) na raiz + Tools (rotacao de tela e
+    # DPI) + hook novo. v1.0.8 mantida como fallback.
+    "HBCD-PE-Chrome-v1.0.9.iso": "application/octet-stream",
+    "HBCD-PE-Chrome-v1.0.8.iso": "application/octet-stream",
 }
 ATUALIZACOES = {}     # nome -> {"espelho","atual"} quando o GitHub tem versão nova
 CHECAGEM = {"quando": 0.0, "erro": ""}
@@ -1163,14 +1174,23 @@ const term=new Terminal({cursorBlink:true,fontSize:14,theme:{background:'#111'}}
 const fit=new FitAddon.FitAddon(); term.loadAddon(fit);
 term.open(document.getElementById('t')); fit.fit();
 // digitação: enfileira e envia UM fetch por vez, em ordem — em paralelo os
-// POSTs chegavam fora de ordem e o comando ia embaralhado/cortado no PTY
-let fila=[], enviando=false;
+// POSTs chegavam fora de ordem e o comando ia embaralhado/cortado no PTY.
+// POST não passa (rede fora ou sessão morta no servidor — web reiniciou,
+// claude saiu, janitor): o item NÃO sai da fila, 3 tentativas espaçadas e,
+// esgotadas, a caixa acende e a mensagem volta pro campo. Antes o erro era
+// engolido em silêncio e a mensagem simplesmente nunca chegava (um episódio
+// no log: 462 POSTs seguidos perdidos com a aba aberta)
+let fila=[], enviando=false, tent=0, morto=false, ultimaMsg='';
 function bombear(){
-  if(enviando||!fila.length) return;
+  if(enviando||morto||!fila.length) return;
   enviando=true;
-  fetch('/painel/term/in?s='+s+'&cid='+encodeURIComponent(cid),{method:'POST',body:fila.shift()})
-    .catch(()=>{})
-    .finally(()=>{enviando=false;bombear();});
+  fetch('/painel/term/in?s='+s+'&cid='+encodeURIComponent(cid),{method:'POST',body:fila[0]})
+    .then(r=>r.ok?r.json():{ok:false},()=>({ok:false}))
+    .then(j=>{
+      if(j&&j.ok!==false){tent=0;fila.shift();enviando=false;bombear();}
+      else if(++tent<3)setTimeout(()=>{enviando=false;bombear();},1500);
+      else chatMorto();
+    },()=>chatMorto());
 }
 term.onData(d=>{fila.push(d);bombear();});
 // caixa de mensagem (modo claude): a linha inteira entra na fila, e o Enter
@@ -1178,9 +1198,31 @@ term.onData(d=>{fila.push(d);bombear();});
 function enviarMsg(){
   const inp=document.getElementById('msg'), v=inp.value;
   if(!v) return;
+  ultimaMsg=v;
   fila.push(v);
   setTimeout(()=>{fila.push('\\r');bombear();},400);
   inp.value=''; inp.focus();
+}
+// envio esgotado: desliga a caixa (digitar aqui era mandar pro vazio),
+// devolve a última mensagem ao campo e a guarda no sessionStorage — o F5
+// que retoma a sessão recupera o texto junto
+function chatMorto(){
+  if(morto) return;
+  morto=true;
+  const inp=document.getElementById('msg');
+  if(ultimaMsg&&!inp.value) inp.value=ultimaMsg;
+  if(inp.value) sessionStorage.setItem('claude-rascunho-'+cid,inp.value);
+  inp.disabled=true;
+  document.getElementById('enviarmsg').disabled=true;
+  inp.placeholder='⚠ não enviado — sessão caiu; copie o texto e F5 retoma';
+  inp.style.background='#3a1119';
+  inp.style.color='#f88';
+}
+// rascunho não enviado de antes do F5: volta ao campo quando a página renasce
+{
+  const r=sessionStorage.getItem('claude-rascunho-'+cid);
+  if(r){document.getElementById('msg').value=r;
+    sessionStorage.removeItem('claude-rascunho-'+cid);}
 }
 document.getElementById('enviarmsg').addEventListener('click',enviarMsg);
 document.getElementById('msg').addEventListener('keydown',e=>{
@@ -1706,6 +1748,7 @@ class Handler(BaseHTTPRequestHandler):
         with open(caminho, "rb") as f:
             self.send_response(200)
             self.send_header("Content-Type", ARQUIVOS_MIRROR[nome])
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % nome)
             self.send_header("Content-Length", str(tamanho))
             self.end_headers()
             while True:
@@ -1920,7 +1963,13 @@ class Handler(BaseHTTPRequestHandler):
             # sessão claude vive em registro próprio, chaveado pelo cliente
             t = CLAUDE_SESSOES.get((qs.get("cid") or [""])[0])
         if not t:
-            self._erro(404, "terminal inexistente")
+            # sessão morta (web reiniciou, claude saiu, janitor): este 404 era
+            # engolido em silêncio pelo chat do painel — a mensagem sumia sem
+            # aviso (episódio no log: 462 POSTs seguidos aqui). Agora ok:false
+            # com registro: o cliente acende a caixa e devolve o texto ao campo
+            print("POST em terminal inexistente (cid=%s, %d B descartados)"
+                  % ((qs.get("cid") or ["?"])[0], len(dados)), flush=True)
+            self._json({"ok": False, "erro": "terminal inexistente"})
             return
         t["ultima"] = time.time()
         if dados:
