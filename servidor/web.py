@@ -1118,14 +1118,29 @@ PAGINA_TERMINAL = """<!doctype html><meta charset=utf-8>
  #alt{background:#5a3c8c;border:0;border-radius:4px;padding:3px 10px;cursor:pointer;
       color:#fff;font-weight:600}
  .sair{color:#777;text-decoration:none;margin-left:auto}
- #t{position:fixed;inset:40px 0 0 0}
+ #t{position:fixed;inset:40px 46px 0 0}
+ /* barra lateral de rolagem: ▲▼ (segurar repete) + trilho com polegar.
+    No shell é scrollbar de verdade (scrollback do xterm, 100% local); no
+    claude (TUI de tela cheia captura o mouse) é uma alavanca — o arrasto
+    do polegar vira rodas pro aplicativo */
+ #sb{position:fixed;top:40px;right:0;bottom:0;width:46px;z-index:4;display:flex;
+     flex-direction:column;background:#161616;border-left:1px solid #2b2b2b;
+     touch-action:none;user-select:none;-webkit-user-select:none}
+ body.claude #sb{bottom:60px}
+ #sb button{flex:0 0 auto;background:#222;border:0;color:#aaa;font-size:15px;
+     line-height:1;padding:13px 0;cursor:pointer;touch-action:none}
+ #sb button:active{background:#3c4257;color:#fff}
+ #sbTrack{flex:1;position:relative;margin:6px 5px;cursor:pointer;touch-action:none}
+ #sbThumb{position:absolute;left:0;right:0;height:56px;top:50%;border-radius:7px;
+     background:#39415a;transition:top .25s ease,height .25s ease}
+ #sbThumb.on{background:#5d6b96}
  /* caixa de mensagem do modo claude (modelo vscode): digitação local num
     input de verdade, linha inteira viaja atômica — sem sincronizar
     letra a letra com o TUI pelo túnel */
  #chatbar{display:none;position:fixed;left:0;right:0;bottom:0;gap:8px;padding:8px 10px;
           background:#1b1b1b;border-top:1px solid #333;align-items:center;z-index:5}
  body.claude #chatbar{display:flex}
- body.claude #t{inset:40px 0 60px 0}
+ body.claude #t{inset:40px 46px 60px 0}
  /* claude: a chatbar é a única entrada — esconde o textarea que o xterm cria
     para capturar teclado (no celular ele aparece como um 2º input) */
  body.claude .xterm-helper-textarea{display:none!important}
@@ -1140,6 +1155,8 @@ PAGINA_TERMINAL = """<!doctype html><meta charset=utf-8>
  <button id=alt title="trocar entre shell do cliente e claude"></button>
  <a class=sair href=/painel>voltar ao painel</a></div>
 <div id=t></div>
+<div id=sb><button id=sbUp>▲</button><div id=sbTrack><div id=sbThumb></div></div>
+ <button id=sbDn>▼</button></div>
 <div id=chatbar><button id=escbtn title="tecla Esc — interrompe o claude">esc</button>
  <input id=msg placeholder="mensagem para o claude — Enter envia" autocomplete=off>
  <button id=enviarmsg>enviar</button></div>
@@ -1241,26 +1258,117 @@ document.getElementById('t').addEventListener('touchend',e=>{
   if(tArr>12) return;
   e.preventDefault();focar();
 });
-// TUI de tela cheia (claude): ela liga o alternate screen e captura o mouse —
-// no xterm não existe scrollback ali e o TOQUE não vira evento de roda pro
-// aplicativo (só a roda do mouse vira). O arrasto do dedo é traduzido aqui em
-// rodadas SGR (64=sobe, 65=desce), mesmo protocolo que a roda usa lá em cima
+// ---------- rolagem: canal próprio, coalescido ----------
+// TUI de tela cheia (claude) liga o alternate screen e captura o mouse: não
+// há scrollback no xterm e o toque não vira roda pro aplicativo — o arrasto
+// é traduzido aqui em rodadas SGR (64=sobe, 65=desce), mesmo protocolo da
+// roda do mouse. As rodas saem por um canal SEPARADO da fila de digitação:
+// 1 POST em voo, tudo acumulado desde o último viaja junto. Antes cada
+// rajada entrava na fila da digitação (1 ida-e-volta de rede por roda) — a
+// fila entupia, o scroll ficava travado e os comandos digitados chegavam
+// atrasados atrás das rodas.
+const RODA_MAX=24;    // teto do acumulado: scroll é best-effort, não bombarda
+let rodasAcum=0, rodasVoo=false;
+function rodaStr(n){  // n>0 sobe, n<0 desce
+  const b=n>0?64:65, col=Math.max(1,term.cols>>1), lin=Math.max(1,term.rows>>1),
+        par='\\x1b[<'+b+';'+col+';'+lin;
+  let s='';
+  for(let i=0;i<Math.abs(n);i++) s+=par+'M'+par+'m';
+  return s;
+}
+function despacharRodas(){
+  const n=rodasAcum; rodasAcum=0; rodasVoo=true;
+  fetch('/painel/term/in?s='+s+'&cid='+encodeURIComponent(cid),{method:'POST',body:rodaStr(n)})
+    .then(r=>r.ok,()=>false)
+    .then(ok=>{rodasVoo=false; if(ok&&rodasAcum) despacharRodas();});
+}
+function rolar(d){    // d rodas: +sobe, -desce
+  if(!d) return;
+  if(term.buffer.active.type!=='alternate'){term.scrollLines(d);return;} // local
+  rodasAcum=Math.max(-RODA_MAX,Math.min(RODA_MAX,rodasAcum+d));
+  if(rodasAcum&&!rodasVoo) despacharRodas();
+}
+// arrasto na própria tela: claude = rodas pro TUI; shell = scrollback local
+// (no celular o viewport do xterm não responde a toque — só à roda do mouse)
 let tY=0,tAc=0;
 document.getElementById('t').addEventListener('touchstart',e=>{
   tY=e.touches[0].clientY;tAc=0;tArr=0;},{passive:true});
 document.getElementById('t').addEventListener('touchmove',e=>{
-  if(term.buffer.active.type!=='alternate') return;  // buffer normal: xterm rola
   e.preventDefault();
   const y=e.touches[0].clientY;tAc+=tY-y;tArr+=Math.abs(tY-y);tY=y;
-  const col=Math.max(1,term.cols>>1),lin=Math.max(1,term.rows>>1),passo=48;
-  let rodas='';
+  const passo=term.buffer.active.type==='alternate'?48:30;
   while(Math.abs(tAc)>=passo){
-    const b=tAc>0?64:65;
+    rolar(tAc>0?1:-1);
     tAc+=tAc>0?-passo:passo;
-    rodas+='\\x1b[<'+b+';'+col+';'+lin+'M\\x1b[<'+b+';'+col+';'+lin+'m';
   }
-  if(rodas){fila.push(rodas);bombear();}
 },{passive:false});
+// ---------- barra lateral ▲▼ + trilho ----------
+// ▲▼: toque curto = 1 roda; segurar repete (120ms) e dobra o passo após ~1s
+function botaoRolar(el,dir){
+  let rep=null,n;
+  const parar=()=>{clearInterval(rep);rep=null;};
+  el.addEventListener('pointerdown',e=>{
+    e.preventDefault();
+    try{el.setPointerCapture(e.pointerId);}catch(_){}
+    rolar(dir); n=1;
+    rep=setInterval(()=>rolar(++n>8?dir*2:dir),120);
+  });
+  ['pointerup','pointercancel','lostpointercapture'].forEach(ev=>el.addEventListener(ev,parar));
+}
+botaoRolar(document.getElementById('sbUp'),1);
+botaoRolar(document.getElementById('sbDn'),-1);
+// trilho: claude = alavanca (26px = 1 roda; ao soltar o polegar volta ao
+// centro — a posição real do histórico só o TUI conhece); shell = scrollbar
+// de verdade, polegar proporcional à posição do scrollback
+const sbT=document.getElementById('sbTrack'), sbTh=document.getElementById('sbThumb');
+const bufY=b=>b.viewportY!==undefined?b.viewportY:(b.ydisp||0);
+let sbDrag=null;
+function syncThumb(){
+  if(sbDrag) return;
+  const h=sbT.clientHeight;
+  if(term.buffer.active.type==='alternate'){
+    sbTh.style.height='56px'; sbTh.style.top=((h-56)/2)+'px';
+    return;
+  }
+  const b=term.buffer.active, m=Math.max(1,b.length-term.rows);
+  const th=Math.max(28,Math.min(h,Math.round(term.rows/b.length*h)));
+  sbTh.style.height=th+'px';
+  sbTh.style.top=Math.min(h-th,Math.max(0,Math.round(bufY(b)/m*(h-th))))+'px';
+}
+setInterval(syncThumb,150); syncThumb();
+sbT.addEventListener('pointerdown',e=>{
+  e.preventDefault();
+  try{sbT.setPointerCapture(e.pointerId);}catch(_){}
+  sbTh.style.transition='none'; sbTh.classList.add('on');
+  if(term.buffer.active.type!=='alternate'){
+    // toque no trilho pula pra posição proporcional e o arrasto segue dali
+    const b=term.buffer.active, m=Math.max(1,b.length-term.rows),
+          r=Math.min(1,Math.max(0,(e.clientY-sbT.getBoundingClientRect().top)/sbT.clientHeight));
+    term.scrollToLine(Math.round(r*m));
+  }
+  sbDrag={y0:e.clientY};
+});
+sbT.addEventListener('pointermove',e=>{
+  if(!sbDrag) return;
+  if(term.buffer.active.type==='alternate'){
+    const rodas=Math.trunc((sbDrag.y0-e.clientY)/26);
+    if(rodas){rolar(rodas);sbDrag.y0-=rodas*26;}
+    const h=sbT.clientHeight,   // polegar acompanha o dedo, limitado ao trilho
+          top=Math.min(h-56,Math.max(0,(h-56)/2+(e.clientY-sbDrag.y0)));
+    sbTh.style.top=top+'px';
+  }else{
+    const b=term.buffer.active, m=Math.max(1,b.length-term.rows),
+          r=Math.min(1,Math.max(0,(e.clientY-sbT.getBoundingClientRect().top)/sbT.clientHeight));
+    term.scrollToLine(Math.round(r*m));
+  }
+});
+['pointerup','pointercancel','lostpointercapture'].forEach(ev=>sbT.addEventListener(ev,()=>{
+  if(!sbDrag) return;
+  sbDrag=null;
+  sbTh.classList.remove('on');
+  sbTh.style.transition='';   // volta deslizando: centro (alavanca) ou posição
+  syncThumb();
+}));
 // F5/aba fechada: shell morre com a aba; claude FICA VIVO no servidor
 // (reatanexável — igual sessão do code-server), o janitor colhe depois
 addEventListener('pagehide',()=>{
