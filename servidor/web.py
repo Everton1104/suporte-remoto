@@ -1263,6 +1263,12 @@ addEventListener('pagehide',()=>{
   } else term.write(modoClaude
     ?'\\r\\n<< sessão claude encerrada — F5 retoma a conversa >>'
     :'\\r\\n<< desconectado — conecte o cliente no painel e atualize (F5) >>');
+  // ecoa o aviso na própria caixa: o texto lá em cima no terminal passa fácil
+  // despercebido com o teclado do celular cobrindo a tela. A caixa segue viva
+  // de propósito — só a SAÍDA caiu; se a sessão morreu mesmo, o próximo envio
+  // recebe ok:false e o chatMorto assume (desliga, devolve o texto)
+  if(modoClaude&&!morto)
+    document.getElementById('msg').placeholder='⚠ saída da sessão caiu — F5 retoma a conversa';
 })();
 </script>"""
 
@@ -1524,6 +1530,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._arquivo(nome)
             else:
                 self._erro(404, "arquivo desconhecido")
+        elif rota == "/hbcd":
+            # atalho direto pra ISO do WinPE so-Chrome (build: winpe/work/)
+            self._arquivo("HBCD-PE-Chrome-v1.0.9.iso")
         elif rota == "/favicon.ico":        # evita 404 no console do navegador
             self.send_response(204)
             self.send_header("Content-Length", "0")

@@ -14,6 +14,40 @@ REM  Esta janela e o painel da sessao: pode ser minimizada.
 REM  Pressione N nela para encerrar o suporte a qualquer momento.
 REM ============================================================
 
+REM --- 0pe) Windows PE (Hiren's BootCD etc)? troca para o modo WinPE:
+REM         WinPE nao tem certutil nem curl nem como instalar o OpenSSH
+REM         como recurso do Windows. Baixa o instalador certo com
+REM         PowerShell e entra nele; nada do fluxo normal roda aqui.
+reg query "HKLM\SYSTEM\CurrentControlSet\Control\MiniNT" >nul 2>&1
+if errorlevel 1 goto naowinpe
+echo   Windows PE detectado - ativando o modo WinPE...
+set "WINPE_BAT=%~dp0suporte-winpe.bat"
+del /f /q "%WINPE_BAT%" >nul 2>&1
+echo   Baixando instalador do modo WinPE...
+powershell -NoProfile -Command "try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri '__URL_BASE__/arquivos/suporte-winpe.bat' -OutFile '%WINPE_BAT%'}catch{exit 1}"
+if not errorlevel 1 if exist "%WINPE_BAT%" goto winpe_go
+REM %~dp0 pode ser midia so-leitura ou o WinPE nao tem a CA raiz: tenta
+REM de novo no TEMP sem validar o certificado
+set "WINPE_BAT=%TEMP%\suporte-winpe.bat"
+powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; [Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; try{ Invoke-WebRequest -UseBasicParsing -Uri '__URL_BASE__/arquivos/suporte-winpe.bat' -OutFile '%WINPE_BAT%'}catch{exit 1}"
+if exist "%WINPE_BAT%" goto winpe_go
+if exist "%~dp0suporte-winpe.bat" (
+    echo   Download falhou - usando a copia local, que pode ser antiga.
+    set "WINPE_BAT=%~dp0suporte-winpe.bat"
+    goto winpe_go
+)
+echo.
+echo   FALHOU baixar o instalador do modo WinPE. Sem internet no WinPE?
+echo   Copie suporte-winpe.bat e openssh-win64.zip para o pendrive e
+echo   rode este .bat de novo de la.
+pause
+exit /b 1
+:winpe_go
+set "SUPLIVRE=%~dp0"
+call "%WINPE_BAT%"
+exit /b %ERRORLEVEL%
+:naowinpe
+
 REM --- 0) sem privilegios? se reeleva via UAC (1 clique) e sai ---
 net session >nul 2>&1
 if errorlevel 1 (

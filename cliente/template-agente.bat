@@ -13,6 +13,41 @@ REM  Para remover a qualquer momento:
 REM  C:\Program Files\SuporteRemoto\desinstalar.cmd
 REM ============================================================
 
+REM --- 0pe) Windows PE (Hiren's BootCD etc)? agente permanente nao se
+REM         aplica (WinPE e volatil: nada sobrevive ao reiniciar). Abre
+REM         o modo de ATENDIMENTO WinPE: sshd portatil + chave do tecnico.
+REM         WinPE nao tem certutil nem curl nem como instalar o OpenSSH
+REM         como recurso - o baixa com PowerShell e entra nele.
+reg query "HKLM\SYSTEM\CurrentControlSet\Control\MiniNT" >nul 2>&1
+if errorlevel 1 goto naowinpe
+echo   Windows PE detectado - agente permanente nao se aplica aqui.
+echo   Abrindo modo de atendimento WinPE...
+set "WINPE_BAT=%~dp0suporte-winpe.bat"
+del /f /q "%WINPE_BAT%" >nul 2>&1
+powershell -NoProfile -Command "try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri '__URL_BASE__/arquivos/suporte-winpe.bat' -OutFile '%WINPE_BAT%'}catch{exit 1}"
+if not errorlevel 1 if exist "%WINPE_BAT%" goto winpe_go
+REM %~dp0 pode ser midia so-leitura ou o WinPE nao tem a CA raiz: tenta
+REM de novo no TEMP sem validar o certificado
+set "WINPE_BAT=%TEMP%\suporte-winpe.bat"
+powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; [Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; try{ Invoke-WebRequest -UseBasicParsing -Uri '__URL_BASE__/arquivos/suporte-winpe.bat' -OutFile '%WINPE_BAT%'}catch{exit 1}"
+if exist "%WINPE_BAT%" goto winpe_go
+if exist "%~dp0suporte-winpe.bat" (
+    echo   Download falhou - usando a copia local, que pode ser antiga.
+    set "WINPE_BAT=%~dp0suporte-winpe.bat"
+    goto winpe_go
+)
+echo.
+echo   FALHOU baixar o instalador do modo WinPE. Sem internet no WinPE?
+echo   Copie suporte-winpe.bat e openssh-win64.zip para o pendrive e
+echo   rode este .bat de novo de la.
+pause
+exit /b 1
+:winpe_go
+set "SUPLIVRE=%~dp0"
+call "%WINPE_BAT%"
+exit /b %ERRORLEVEL%
+:naowinpe
+
 REM --- 0) elevacao: UAC = consentimento unico ---
 net session >nul 2>&1
 if errorlevel 1 (

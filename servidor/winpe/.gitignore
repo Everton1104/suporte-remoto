@@ -1,0 +1,5 @@
+# artefatos de build da ISO (11GB — wim/liberado, staging, ISO final)
+work/
+# par de chaves do sshd do WinPE — segredo, não vai pro repositório
+chave-tecnico
+chave-tecnico.pub
