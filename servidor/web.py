@@ -1126,6 +1126,12 @@ PAGINA_TERMINAL = """<!doctype html><meta charset=utf-8>
  #sb{position:fixed;top:40px;right:0;bottom:0;width:46px;z-index:4;display:flex;
      flex-direction:column;background:#161616;border-left:1px solid #2b2b2b;
      touch-action:none;user-select:none;-webkit-user-select:none}
+ /* barra antiga embutida do xterm (viewport com overflow-y:scroll) escondida:
+     o scroll continua funcionando — quem rola é a #sb (scrollToLine/rodas).
+     Aqui e não no xterm.css pra não morrer num update da lib */
+ #t .xterm-viewport{scrollbar-width:none}
+ #t .xterm-viewport::-webkit-scrollbar{width:0;height:0}
+ #t .xterm-viewport{overflow-y:scroll}
  body.claude #sb{bottom:60px}
  #sb button{flex:0 0 auto;background:#222;border:0;color:#aaa;font-size:15px;
      line-height:1;padding:13px 0;cursor:pointer;touch-action:none}
