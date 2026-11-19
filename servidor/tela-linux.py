@@ -4,9 +4,10 @@
 # maquina LINUX do cliente. Par do tela.ps1 (Windows): MESMO protocolo HTTP,
 # mesmas rotas e auto-limites — web.py/tela.sh/pagina nao mudam.
 #
-#   GET  /mjpeg  -> stream multipart/x-mixed-replace (um viewer por vez)
+#   GET  /mjpeg?w=&q=&i= -> stream multipart (um viewer; perfil w/q/i)
 #   POST /input  -> injeta evento de mouse/teclado (JSON, mesmo formato do .ps1)
-#   GET  /info   -> {"w":..,"h":..} do quadro do stream
+#   GET  /info   -> {"w":..,"h":..,"fps":..,"kbps":..,"clip":0/1}
+#   GET/POST /clip -> le/escreve a area de transferencia (precisa xclip|xsel)
 #   POST /sair   -> encerra o servidor
 #
 # Dependencias (cascata, nada e instalado por este script):
@@ -192,7 +193,9 @@ class CapturaPIL:
     def __init__(self):
         self.planes = X11.XAllPlanes()
 
-    def quadro(self):
+    def quadro(self, w=None, q=None):
+        w = w or ARGS.largura_max
+        q = q or ARGS.qualidade
         with XLOCK:
             xi_p = X11.XGetImage(DISP, ROOT, 0, 0, TELA_W, TELA_H,
                                  self.planes, 2)  # 2 = ZPixmap
@@ -216,12 +219,12 @@ class CapturaPIL:
             cb = ctypes.cast(xi.destroy_image,
                              ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p))
             cb(xi_p)
-        if img.width > ARGS.largura_max:
-            nh = int(img.height * ARGS.largura_max / img.width)
-            img = img.resize((ARGS.largura_max, nh), Image.LANCZOS)
+        if img.width > w:
+            nh = int(img.height * w / img.width)
+            img = img.resize((w, nh), Image.LANCZOS)
             img = img.convert("RGB")
         bio = BytesIO()
-        img.save(bio, "JPEG", quality=ARGS.qualidade)
+        img.save(bio, "JPEG", quality=q)
         return bio.getvalue()
 
 
@@ -236,7 +239,7 @@ class CapturaFFmpeg:
               if TELA_W > ARGS.largura_max else "null")
         self.proc = subprocess.Popen(
             ["ffmpeg", "-hide_banner", "-loglevel", "error",
-             "-f", "x11grab", "-framerate", "5", "-draw_mouse", "1",
+             "-f", "x11grab", "-framerate", "8", "-draw_mouse", "1",
              "-i", DISPLAY_ACHADO, "-an", "-vf", vf,
              "-f", "mjpeg", "-q:v", str(max(2, 10 - ARGS.qualidade // 10)),
              "pipe:1"],
@@ -270,7 +273,9 @@ class CapturaFFmpeg:
         with self.lock:
             self.ultimo = None
 
-    def quadro(self):
+    def quadro(self, w=None, q=None):
+        # w/q do perfil vem do processo ffmpeg (fixo no launch): a query do
+        # viewer so afeta o pacing — captura ja em 6fps no pipe
         for _ in range(50):  # espera ate ~10s por um frame
             with self.lock:
                 f = self.ultimo
@@ -301,10 +306,12 @@ KEYSYMS = {
     "PageUp": 0xFF55, "PageDown": 0xFF56,
     "ArrowLeft": 0xFF51, "ArrowUp": 0xFF52, "ArrowRight": 0xFF53,
     "ArrowDown": 0xFF54,
+    "Meta": 0xFFEB, "ContextMenu": 0xFF67,   # Super_L / Menu (paridade .ps1)
 }
 for _i in range(1, 13):
     KEYSYMS["F%d" % _i] = 0xFFBE + _i - 1
-MODS = {"ctrl": 0xFFE3, "alt": 0xFFE9, "shift": 0xFFE1}  # Control_L Alt_L Shift_L
+MODS = {"ctrl": 0xFFE3, "alt": 0xFFE9, "shift": 0xFFE1,   # Control_L Alt_L Shift_L
+        "meta": 0xFFEB}                                    # Super_L
 TEM_XDOTOOL = bool(shutil.which("xdotool"))
 
 
@@ -336,7 +343,7 @@ def injeta_tecla(e):
         return
     # shift so acompanha tecla NOMEADA (Enter, F5...) — no evento de caractere
     # o navegador ja manda o char maiusculo (paridade com o .ps1)
-    nomes = ["ctrl", "alt"] + (["shift"] if e.get("k") else [])
+    nomes = ["ctrl", "alt", "meta"] + (["shift"] if e.get("k") else [])
     mods = [MODS[m] for m in nomes if e.get(m)]
     for m in mods:
         _tecla(_keycode(m), True)
@@ -349,7 +356,11 @@ def injeta_tecla(e):
                 time.sleep(0.012)
                 _tecla(kc, False)
         elif len(c) == 1:
-            if (e.get("ctrl") or e.get("alt")) and c.lower().isalpha():
+            # ctrl+alt+caractere = AltGr (pt-BR): keysym unicode direto,
+            # nao forma atalho — paridade com o .ps1
+            if (e.get("ctrl") and e.get("alt")) and not nome:
+                kc = _keycode(ord(c))
+            elif (e.get("ctrl") or e.get("alt")) and c.lower().isalpha():
                 kc = _keycode(ord(c.lower()))     # atalho = tecla fisica
             else:
                 kc = _keycode(ord(c))             # keysym unicode direto
@@ -408,10 +419,41 @@ def injetar(e):
 
 # ------------------------------------------------------------------ servidor
 
-ESTADO = {"viewer": False, "quadros": 0, "ultimo_viewer": time.time()}
+ESTADO = {"viewer": False, "quadros": 0, "ultimo_viewer": time.time(),
+          "win_quadros": 0, "win_bytes": 0, "win_t0": time.time(),
+          "fps": 0, "kbps": 0, "clip": 0}
 ELOCK = threading.Lock()
 INICIO = time.time()
 RODANDO = [True]
+
+# clipboard de texto (paridade .ps1): exige xclip OU xsel no cliente
+_CLIPCMD = shutil.which("xclip"), shutil.which("xsel")
+
+
+def clip_get():
+    # clipboard vazio (ou com nao-texto) devolve rc!=0 + stdout vazio: nao
+    # e erro — devolve "". Erro de verdade (sem xclip, timeout) vira excecao
+    if shutil.which("xclip"):
+        r = subprocess.run(["xclip", "-selection", "clipboard", "-o"],
+                           capture_output=True, timeout=3)
+        return r.stdout.decode("utf-8", "replace")
+    if shutil.which("xsel"):
+        r = subprocess.run(["xsel", "-b", "-o"], capture_output=True, timeout=3)
+        return r.stdout.decode("utf-8", "replace")
+    raise RuntimeError("sem xclip/xsel no cliente")
+
+
+def clip_set(txt):
+    if shutil.which("xclip"):
+        cmd = ["xclip", "-selection", "clipboard"]
+    elif shutil.which("xsel"):
+        cmd = ["xsel", "-b", "-i"]
+    else:
+        raise RuntimeError("sem xclip/xsel no cliente")
+    subprocess.run(cmd, input=txt.encode(), timeout=3)
+
+
+ESTADO["clip"] = 1 if (_CLIPCMD[0] or _CLIPCMD[1]) else 0
 
 
 def _rst(sock):
@@ -445,14 +487,49 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         rota = self.path.split("?")[0]
         if rota == "/info":
-            corpo = json.dumps({"w": W_STREAM, "h": H_STREAM}).encode()
+            # stats da janela atual (a pagina le a cada ~2s; reset junto)
+            agora = time.time()
+            with ELOCK:
+                seg = agora - ESTADO["win_t0"]
+                if seg >= 1.0:
+                    ESTADO["fps"] = int(round(ESTADO["win_quadros"] / seg))
+                    ESTADO["kbps"] = int(round(ESTADO["win_bytes"] / seg / 1024))
+                    ESTADO["win_quadros"] = 0
+                    ESTADO["win_bytes"] = 0
+                    ESTADO["win_t0"] = agora
+                corpo = json.dumps({"w": W_STREAM, "h": H_STREAM,
+                                    "fps": ESTADO["fps"],
+                                    "kbps": ESTADO["kbps"],
+                                    "clip": ESTADO["clip"]}).encode()
             self._resp(200, corpo, "application/json")
+        elif rota == "/clip":
+            try:
+                self._resp(200, clip_get().encode("utf-8"),
+                           "text/plain; charset=utf-8")
+            except Exception as exc:
+                self._resp(500, ("clip: %s" % exc).encode())
         elif rota == "/mjpeg":
             self._mjpeg()
         else:
             self._resp(404, b"??")
 
     def _mjpeg(self):
+        # perfil da conexao: ?w=largura&q=qualidade&i=intervalo_ms (clamp;
+        # no backend ffmpeg so o i tem efeito — captura fixa no launch)
+        p = dict(a.split("=", 1) for a in self.path.split("?")[1].split("&")
+                 if "=" in a) if "?" in self.path else {}
+        try:
+            w = min(1920, max(640, int(p.get("w", ARGS.largura_max))))
+        except ValueError:
+            w = ARGS.largura_max
+        try:
+            q = min(80, max(30, int(p.get("q", ARGS.qualidade))))
+        except ValueError:
+            q = ARGS.qualidade
+        try:
+            iv = min(1000, max(60, int(p.get("i", ARGS.intervalo))))
+        except ValueError:
+            iv = ARGS.intervalo
         with ELOCK:
             if ESTADO["viewer"]:
                 self._resp(409, b"viewer ja conectado")
@@ -462,7 +539,7 @@ class Handler(BaseHTTPRequestHandler):
             # captura de PROVA antes de comprometer o viewer (paridade .ps1):
             # sem isto, falha pos-headers = 200 vazio = pagina carregando eterno
             try:
-                CAPTURA.quadro()
+                CAPTURA.quadro(w, q)
             except Exception as exc:
                 log("ERRO captura: %s" % exc)
                 self._resp(500, ("captura falhou: %s" % exc).encode())
@@ -472,21 +549,27 @@ class Handler(BaseHTTPRequestHandler):
                              "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Connection", "close")
             self.end_headers()
-            log("viewer conectado")
+            log("viewer conectado (w=%d q=%d i=%d)" % (w, q, iv))
             self.connection.settimeout(3)
-            q = None
+            frame = None
             while RODANDO[0]:
-                if q is None:
-                    q = CAPTURA.quadro()
+                t0 = time.time()
+                if frame is None:
+                    frame = CAPTURA.quadro(w, q)
                 cab = (b"--frame\r\nContent-Type: image/jpeg\r\n"
-                       b"Content-Length: %d\r\n\r\n" % len(q))
-                self.wfile.write(cab + q + b"\r\n")
+                       b"Content-Length: %d\r\n\r\n" % len(frame))
+                self.wfile.write(cab + frame + b"\r\n")
                 self.wfile.flush()
                 with ELOCK:
                     ESTADO["quadros"] += 1
                     ESTADO["ultimo_viewer"] = time.time()
-                q = None
-                time.sleep(ARGS.intervalo / 1000.0)
+                    ESTADO["win_quadros"] += 1
+                    ESTADO["win_bytes"] += len(frame)
+                frame = None
+                # pacing: dorme so o que sobrou do intervalo-alvo
+                resto = iv / 1000.0 - (time.time() - t0)
+                if resto > 0:
+                    time.sleep(resto)
         except Exception as exc:
             log("viewer desconectou (%s)" % exc)
             _rst(self.connection)
@@ -515,6 +598,13 @@ class Handler(BaseHTTPRequestHandler):
             with ELOCK:
                 ESTADO["ultimo_viewer"] = time.time()
             self._resp(204)
+        elif rota == "/clip":
+            try:
+                clip_set(corpo.decode("utf-8"))
+                self._resp(204)
+            except Exception as exc:
+                log("clip: falhou (%s)" % exc)
+                self._resp(500, ("clip: %s" % exc).encode())
         elif rota == "/sair":
             self._resp(204)
             log("pedido /sair")
