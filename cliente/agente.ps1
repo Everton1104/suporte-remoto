@@ -32,6 +32,29 @@ while ($true) {
         Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $d 'desinstalar.ps1')
         exit
     }
+    # auto-update do cloudflared: servidor manda cf_versao no estado; se
+    # divergir do cf-versao.txt local, baixa o exe novo do espelho e troca
+    # (somente com tunel fechado, pra nao derrubar sessao em andamento)
+    if ($null -ne $e -and $e.cf_versao -and $null -eq $ssh) {
+        $arq_versao = Join-Path $d 'cf-versao.txt'
+        $versao_local = ''
+        if (Test-Path $arq_versao) { $versao_local = (Get-Content $arq_versao -Raw).Trim() }
+        if ($versao_local -ne "$($e.cf_versao)".Trim()) {
+            Log "atualizando cloudflared para $($e.cf_versao) (local: $versao_local)"
+            try {
+                $novo = Join-Path $env:TEMP 'cloudflared-novo.exe'
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -Uri "$url/arquivos/cloudflared-windows-amd64.exe" -OutFile $novo -UseBasicParsing -TimeoutSec 120
+                if ((Get-Item $novo).Length -gt 5000000) {
+                    Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+                    Start-Sleep -Seconds 1
+                    Move-Item $novo (Join-Path $d 'cloudflared.exe') -Force
+                    Set-Content $arq_versao "$($e.cf_versao)"
+                    Log "cloudflared atualizado para $($e.cf_versao)"
+                } else { Log "download veio truncado, tentarei de novo no proximo poll" }
+            } catch { Log "falha ao atualizar cloudflared: $($_.Exception.Message)" }
+        }
+    }
     # cloudflared morto com túnel pedido: recomeça (antes o agente travava para sempre)
     if ($null -ne $cf -and $cf.HasExited) {
         Log "cloudflared caiu (exit $($cf.ExitCode)):"

@@ -196,11 +196,16 @@ powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='ss
 schtasks /end /tn SuporteRemoto >nul 2>&1
 schtasks /delete /tn SuporteRemoto /f >nul 2>&1
 
-REM --- 9) escreve o agente e o desinstalador (embutidos em base64) ---
+REM --- 9) escreve o agente e o desinstalador (embutidos em base64).
+REM     O placeholder vira VARIAS linhas echo de 4 KB (primeiro chunk
+REM     inline aqui): a linha do cmd tem limite de 8191 chars e um echo
+REM     unico com o agente inteiro era truncado - agente.ps1 cortado,
+REM     tarefa agendada morrendo sem pollar e este .bat abortando
+REM     antes do schtasks (aconteceu no adjundiai39 em 17/11).
 >  "%DIR%\b64.tmp" echo __AGENTE_PS1_B64__
-certutil -decode "%DIR%\b64.tmp" "%DIR%\agente.ps1" >nul
+certutil -decode -f "%DIR%\b64.tmp" "%DIR%\agente.ps1" >nul
 >  "%DIR%\b64.tmp" echo __DESINSTALAR_PS1_B64__
-certutil -decode "%DIR%\b64.tmp" "%DIR%\desinstalar.ps1" >nul
+certutil -decode -f "%DIR%\b64.tmp" "%DIR%\desinstalar.ps1" >nul
 del "%DIR%\b64.tmp" >nul 2>&1
 >  "%DIR%\desinstalar.cmd" echo @echo off
 >> "%DIR%\desinstalar.cmd" echo powershell -NoProfile -ExecutionPolicy Bypass -File "%%~dp0desinstalar.ps1"
@@ -210,11 +215,11 @@ REM --- 9b) comandos do tecnico no System32: suporte-mensagem (popup OK) e
 REM     suporte-pergunta (input com resposta) para uso dentro da sessao do
 REM     cliente; CRLF/BOM ja vem embutidos no base64
 >  "%DIR%\b64.tmp" echo __MSG_CMD_B64__
-certutil -decode "%DIR%\b64.tmp" "C:\Windows\System32\suporte-mensagem.cmd" >nul
+certutil -decode -f "%DIR%\b64.tmp" "C:\Windows\System32\suporte-mensagem.cmd" >nul
 >  "%DIR%\b64.tmp" echo __PERG_CMD_B64__
-certutil -decode "%DIR%\b64.tmp" "C:\Windows\System32\suporte-pergunta.cmd" >nul
+certutil -decode -f "%DIR%\b64.tmp" "C:\Windows\System32\suporte-pergunta.cmd" >nul
 >  "%DIR%\b64.tmp" echo __PERG_PS1_B64__
-certutil -decode "%DIR%\b64.tmp" "C:\Windows\System32\suporte-pergunta-run.ps1" >nul
+certutil -decode -f "%DIR%\b64.tmp" "C:\Windows\System32\suporte-pergunta-run.ps1" >nul
 del "%DIR%\b64.tmp" >nul 2>&1
 
 REM --- 10) servico: tarefa agendada no boot, SYSTEM, sempre rodando ---

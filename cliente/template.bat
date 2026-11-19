@@ -147,7 +147,7 @@ if not exist "%WORK%\cloudflared.exe" (
 
 REM --- 6) reconstrui a chave efemera desta sessao (veio embutida em base64) ---
 >  "%WORK%\chave.b64" echo __CHAVE_CLIENTE_B64__
-certutil -decode "%WORK%\chave.b64" "%WORK%\chave_cliente" >nul
+certutil -decode -f "%WORK%\chave.b64" "%WORK%\chave_cliente" >nul
 
 REM --- 7) tunel local ate o servidor (SSH via HTTPS da Cloudflare) ---
 start "suporte-remoto tunel" /min "%WORK%\cloudflared.exe" access tcp --hostname __DOMINIO__ --url localhost:__PORTA_PROXY__
