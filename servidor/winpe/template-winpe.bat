@@ -20,8 +20,14 @@ REM ============================================================
 set "WORK=%TEMP%\suporte-winpe"
 set "URL_BASE=__URL_BASE__"
 
+REM beacons: cada passo "canta" no servidor (wpe-beacons.log). As rotinas
+REM :beacon/:beaconarq ficam NO FIM do arquivo — corpo de sub-rotina no
+REM caminho linear do bat e executado de retes a retes e o exit /b dela
+REM mata o script em silencio (bug de 11/11: o bat morria antes do banner)
+
 echo.
 echo   SUPORTE REMOTO - modo WinPE (__ID__)
+call :beacon 01-inicio
 echo   Preparando (automatico), aguarde...
 echo   Voce esta logado como: %USERNAME%
 echo.
@@ -51,6 +57,7 @@ if errorlevel 1 (
     exit /b 1
 )
 :temzip
+call :beacon 02-zip-ok
 if not exist "%ZIP%" goto zipruim
 for %%F in ("%ZIP%") do if %%~zF LSS 1000000 goto zipruim
 REM    integridade: SHA256 embutido pelo gerar-winpe.sh. Download que
@@ -65,6 +72,7 @@ REM     executando o ssh.exe do proprio zip - mesmas DLLs do sshd.
 if not exist "%WORK%\OpenSSH-Win64\ssh.exe" powershell -NoProfile -Command "try{Expand-Archive -LiteralPath '%ZIP%' -DestinationPath '%WORK%' -Force}catch{exit 1}" || goto zipruim
 if not exist "%WORK%\OpenSSH-Win64\sshd.exe" goto zipruim
 "%WORK%\OpenSSH-Win64\ssh.exe" -V >nul 2>&1 || goto zipruim
+call :beacon 03-extraido-ok
 pushd "%WORK%\OpenSSH-Win64"
 
 REM WinPE pode nao exportar ProgramData - sshd/ssh-keygen precisam
@@ -73,12 +81,15 @@ mkdir "%ProgramData%\ssh" >nul 2>&1
 
 echo   Gerando chaves do host...
 ssh-keygen -A -N "" >nul 2>&1
+call :beacon 04-chaves-ok
 if not exist sshd_config copy /y sshd_config_default sshd_config >nul
+call :beacon 05-config-ok
 
 REM --- 3) autoriza o tecnico desta sessao (chave publica, 1 linha) ---
 REM    via SID, a prova de idioma do Windows (Administradores/SYSTEM)
 > "%ProgramData%\ssh\administrators_authorized_keys" echo __PUBKEY_TECNICO__
 icacls "%ProgramData%\ssh\administrators_authorized_keys" /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" >nul
+call :beacon 06-authkeys-ok
 
 REM --- 4) sobe o sshd como processo de console (nao e servico) ---
 REM     WinPE pode ter firewall ativo: libera a entrada na porta 22
@@ -90,24 +101,22 @@ REM     start DIRETO do exe: wrapper cmd /c entre o start e o sshd deu
 REM     popup 0xc0000142 em campo (DLL init); direto foi como a porta
 REM     22 ja abriu com sucesso nesta mesma maquina
 start "sshd suporte" /min sshd.exe -f "%CD%\sshd_config" -E "%WORK%\sshd.log"
-ping -n 4 127.0.0.1 >nul
+call :beacon 08-sshd-startou
 
-REM --- 5) confirma que a porta 22 responde ---
+REM --- 5) confirma que a porta 22 responde (UMA vez, 5s) ------------
+REM     6/11: nesta ISO o sshd.exe morre no nascimento (crash de DLL
+REM     init; -t passa, log nem abre). Retentativas e Get-Process
+REM     travavam o loop — agora: 1 teste rapido e, sem porta, direto
+REM     pro MODO COMANDO REMOTO (o tecnico diagnostica por la).
+ping -n 6 127.0.0.1 >nul
 powershell -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient; try{$c.Connect('127.0.0.1',22); exit 0}catch{exit 1}finally{$c.Close()}"
-if errorlevel 1 (
-    echo.
-    echo   FALHOU: o sshd nao abriu a porta 22. Diagnostico completo:
-    "%CD%\sshd.exe" -t -f "%CD%\sshd_config" > "%WORK%\sshd-teste.txt" 2>&1
-    powershell -NoProfile -Command "if(Test-Path '%WORK%\sshd-teste.txt'){Get-Content '%WORK%\sshd-teste.txt'}"
-    powershell -NoProfile -Command "if(Test-Path '%WORK%\sshd.err'){Get-Content '%WORK%\sshd.err'}"
-    powershell -NoProfile -Command "if(Test-Path '%WORK%\sshd.log'){Get-Content '%WORK%\sshd.log' -Tail 10}"
-    echo   ---
-    echo   Host keys presentes em %ProgramData%\ssh :
-    dir /b "%ProgramData%\ssh\ssh_host_*" 2>nul
-    echo   ---
-    pause
-    goto limpeza
-)
+if not errorlevel 1 goto portaok
+call :beacon 30-FALHOU-porta-22
+goto modoshell
+
+:portaok
+call :beacon 20-SESSAO-ATIVA
+echo   [passo: porta 22 OK]
 
 echo.
 echo   ============================================================
@@ -124,7 +133,8 @@ REM --- 6) mantem a sessao viva ate o sshd cair ou fechar a janela ---
 REM     WinPE pode nao ter choice nem timeout: ping faz o papel de sleep.
 :espera
 ping -n 6 127.0.0.1 >nul
-tasklist /FI "IMAGENAME eq sshd.exe" 2>nul | find /I "sshd.exe" >nul || goto limpeza
+powershell -NoProfile -Command "if(Get-Process sshd -ErrorAction SilentlyContinue){exit 0}else{exit 1}"
+if errorlevel 1 goto limpeza
 goto espera
 
 :zipruim
@@ -159,3 +169,24 @@ rd /s /q "%WORK%" >nul 2>&1
 echo   Sessao encerrada. (WinPE e volatil: ao reiniciar nada sobra.)
 pause
 exit /b 0
+
+:modoshell
+echo   ============================================================
+echo     MODO COMANDO REMOTO ATIVO (sshd nao sobe neste PE)
+echo     Deixe esta janela ABERTA: o tecnico controla a maquina
+echo     pelo servidor (busca comando a cada ~7s e devolve a
+echo     saida). Fechou a janela ou reiniciou, encerrou.
+echo   ============================================================
+call :beacon 40-MODO-COMANDO-ATIVO
+:msloop
+powershell -NoProfile -Command "try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $r=(iwr -UseBasicParsing '%URL_BASE%/wpecmd/__TOKEN_WPE__' -TimeoutSec 8).Content; if($r -and $r -ne 'vazio'){ $o=(iex $r 2>&1|Out-String); $t=$o.Substring(0,[Math]::Min(3000,$o.Length)); iwr -UseBasicParsing ('%URL_BASE%/wpebeacon/OUT-'+[uri]::EscapeDataString($t)) -TimeoutSec 8|Out-Null }}catch{}"
+ping -n 4 127.0.0.1 >nul
+goto msloop
+
+REM ---- sub-rotinas de beacon (NO FIM: nunca no caminho linear!) ----
+:beacon
+powershell -NoProfile -Command "try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; iwr -UseBasicParsing ('%URL_BASE%/wpebeacon/'+[uri]::EscapeDataString('%~1')) -TimeoutSec 4}catch{}" >nul 2>&1
+exit /b
+:beaconarq
+powershell -NoProfile -Command "try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $l=Get-Content '%~1' -Raw; if($l){iwr -UseBasicParsing ('%URL_BASE%/wpebeacon/'+[uri]::EscapeDataString($l.Substring(0,[Math]::Min(2000,$l.Length)))) -TimeoutSec 4}}catch{}" >nul 2>&1
+exit /b

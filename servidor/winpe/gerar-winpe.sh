@@ -10,7 +10,7 @@ set -euo pipefail
 
 BASE=$(cd "$(dirname "$0")" && pwd)
 URL_BASE=${URL_BASE:-https://suporte.evertonrs.com.br}
-ID="winpe-$(date +%Y%m%d)"
+ID="winpe-$(date +%Y%m%d-%H%M)"
 
 # par de chaves fixo do modo WinPE (rotacionavel apagando os arquivos)
 if [ ! -f "$BASE/chave-tecnico" ]; then
@@ -27,10 +27,16 @@ ZIP="$BASE/../static/openssh-winpe-v95.zip"
 [ -f "$ZIP" ] || { echo "ERRO: $ZIP ausente ( rode atualizar-espelho.sh )"; exit 1; }
 SHA=$(sha256sum "$ZIP" | awk '{print $1}')
 
+# token do canal de comando remoto /wpecmd: novo a cada render; o web.py
+# so aceita o que bater com servidor/wpe-token.txt
+TOKEN=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
+echo -n "$TOKEN" > "$BASE/../wpe-token.txt"
+
 sed -e "s|__URL_BASE__|$URL_BASE|g" \
     -e "s|__PUBKEY_TECNICO__|$PUBKEY|" \
     -e "s|__ID__|$ID|g" \
     -e "s|__SHA256_ZIP__|$SHA|" \
+    -e "s|__TOKEN_WPE__|$TOKEN|g" \
     "$BASE/template-winpe.bat" \
   | sed 's/$/\r/' > "$BASE/suporte-winpe.bat"
 
