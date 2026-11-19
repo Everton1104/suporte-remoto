@@ -18,3 +18,6 @@ servidor/extensoes/*.vsix
 
 # preferências locais de editor/agentes
 .claude/settings.local.json
+
+# prints de tela recebidos no chat do painel (dado de cliente, fora do git)
+servidor/uploads/

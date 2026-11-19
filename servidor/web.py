@@ -22,9 +22,15 @@ Rotas do técnico:
                               sessão que administra a frota no servidor)
   GET  /painel/term/stream?cid=&s= -> PTY do atender.sh, saída em stream até fechar
   POST /painel/term/in?s=  -> teclas (corpo cru) | size (cols/rows) | fechar
+  POST /painel/term/imagem?s=&cid= -> print/imagem do técnico (JSON {b64}):
+                              salva em servidor/uploads/ e devolve o caminho;
+                              a página injeta "print de tela: <caminho>" no
+                              chat do claude, que abre o arquivo com Read
   GET  /painel/tela?cid=   -> página da tela ao vivo do cliente (MJPEG)
-  GET  /painel/tela/stream?cid= -> relay do stream do tela.ps1 (túnel reverso)
+  GET  /painel/tela/stream?cid=&w=&q=&i= -> relay do stream (perfil de qualidade)
   POST /painel/tela/in     -> evento de mouse/teclado (controle remoto)
+  GET  /painel/tela/info?cid= -> stats do stream (fps/kbps) da página
+  GET/POST /painel/tela/clip -> clipboard de texto do cliente (colar/copiar)
   POST /painel/tela/parar  -> derruba listener no cliente + ssh -L
   POST /painel/verificar   -> reconsulta o GitHub na hora (alimenta o aviso)
   POST /painel/atualizar   -> roda atualizar-espelho.sh em background; o
@@ -33,6 +39,10 @@ Rotas do técnico:
 
 Credenciais em servidor/clientes.json (reg.login, senha PBKDF2); o token_painel
 segue como chave de API. Sessões em memória: reiniciar o serviço desloga.
+2FA opcional (TOTP, RFC 6238) em servidor/2fa.json: com ele ativo, senha (ou
+bookmark com token) + código de 6 dígitos do app autenticador; curl LOCAL
+continua só com token (o operador roda no próprio servidor). Sem 2fa.json ou
+com ativo=false, nada muda.
 
 Registro em servidor/clientes.json; chaves do técnico por cliente em
 servidor/clientes/<id>/. Portas reversas: 10023+ (10022 = sessão única).
@@ -43,6 +53,7 @@ import base64
 import fcntl
 import hashlib
 import hmac
+import io
 import json
 import os
 import pty
@@ -60,9 +71,10 @@ import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta
+from html import escape as html_escape
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 PORTA = 8090
@@ -133,11 +145,10 @@ ARQUIVOS_MIRROR = {   # rota /arquivos/<nome> -> content-type (whitelist fechada
     "suporte-winpe.bat": "application/octet-stream",
     "openssh-winpe-v95.zip": "application/zip",
     # WinPE so-Chrome (Hiren's PE customizado; ver servidor/winpe/work/ e
-    # memoria winpe-chrome-custom.md). v1.0.9 (6/11): Chrome portatil do
-    # Everton (GoogleChromePortable 157) na raiz + Tools (rotacao de tela e
-    # DPI) + hook novo. v1.0.8 mantida como fallback.
-    "HBCD-PE-Chrome-v1.0.9.iso": "application/octet-stream",
-    "HBCD-PE-Chrome-v1.0.8.iso": "application/octet-stream",
+    # memoria winpe-chrome-custom.md). v1.0.10 (6/11): driver Intel COMPLETO
+    # (sem corte — corte quebra o pnputil = 1 saida de video) + Chrome
+    # portatil + Tools (MultiMonitorTool, rotacao, DPI) + DiagVideo.
+    "HBCD-PE-Chrome-v1.0.10.iso": "application/octet-stream",
 }
 ATUALIZACOES = {}     # nome -> {"espelho","atual"} quando o GitHub tem versão nova
 CHECAGEM = {"quando": 0.0, "erro": ""}
@@ -194,6 +205,88 @@ def _carregar_sessoes():
         SESSOES.pop(sid)
     if brutas:
         _salvar_sessoes()
+
+
+# ---- 2FA (TOTP) — ativado pelo técnico em /painel/2fa/setup ----
+ARQ_2FA = os.path.join(BASE, "2fa.json")
+_2FA_PRE = {}          # pre-token (senha/token validados) -> expiração
+_2FA_PRE_MIN = 10      # minutos que o pre-token vale
+_2FA_TENTATIVAS = {}   # ip -> [timestamps unix das tentativas de código]
+_2FA_MAX_TENT = 8      # códigos errados por 10 min por ip
+_2FA_RECODIGOS = 8     # códigos de recuperação gerados na ativação
+
+
+def carregar_2fa():
+    try:
+        with open(ARQ_2FA) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def salvar_2fa(d2):
+    tmp = ARQ_2FA + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d2, f, indent=1, sort_keys=True)
+    os.replace(tmp, ARQ_2FA)
+
+
+def novo_2fa():
+    d2 = {"ativo": False,
+          "secret": base64.b32encode(secrets.token_bytes(20)).decode(),
+          "recuperacao": []}
+    salvar_2fa(d2)
+    return d2
+
+
+def _totp(secret, t):
+    """Código TOTP de 6 dígitos (RFC 6238, SHA1, passo 30s)."""
+    chave = base64.b32decode(secret + "=" * ((8 - len(secret) % 8) % 8),
+                             casefold=True)
+    h = hmac.new(chave, struct.pack(">Q", int(t // 30)), hashlib.sha1).digest()
+    o = h[-1] & 0xF
+    return "%06d" % ((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % 1_000_000)
+
+
+def totp_ok(secret, codigo):
+    """Válido no passo atual ±1 (relógio levemente adiantado/atrasado)."""
+    c = re.sub(r"[^0-9]", "", codigo or "")
+    if len(c) != 6:
+        return False
+    t = time.time()
+    return any(hmac.compare_digest(_totp(secret, t + i * 30), c)
+               for i in (-1, 0, 1))
+
+
+def _novas_recuperacoes(d2):
+    """8 códigos de uso único (impressos uma vez na ativação)."""
+    codigos = [secrets.token_hex(5).upper() for _ in range(_2FA_RECODIGOS)]
+    d2["recuperacao"] = [hashlib.sha256(c.encode()).hexdigest() for c in codigos]
+    salvar_2fa(d2)
+    return codigos
+
+
+def recuperacao_ok(d2, codigo):
+    """Código de recuperação certo é consumido (só vale uma vez)."""
+    c = (codigo or "").strip()
+    if not c:
+        return False
+    alvo = hashlib.sha256(c.encode()).hexdigest()
+    for i, h in enumerate(d2.get("recuperacao") or []):
+        if hmac.compare_digest(h, alvo):
+            d2["recuperacao"].pop(i)
+            salvar_2fa(d2)
+            return True
+    return False
+
+
+def _pre_2fa():
+    """Ticket curto que prova que a senha (ou o token) já foi validada."""
+    pre = secrets.token_urlsafe(18)
+    _2FA_PRE[pre] = datetime.now() + timedelta(minutes=_2FA_PRE_MIN)
+    for k in [k for k, v in _2FA_PRE.items() if v < datetime.now()]:
+        _2FA_PRE.pop(k, None)
+    return pre
 
 
 def carregar():
@@ -299,10 +392,17 @@ def estado(cid):
             return None
         c["ultimo_contato"] = agora()
         salvar(reg)
+        # cf_versao: agente compara com cf-versao.txt local e auto-atualiza o
+        # cloudflared.exe pelo espelho /arquivos/ quando divergir
+        try:
+            with open(ARQ_VERSOES) as f:
+                cf_ver = json.load(f).get("cloudflared", "")
+        except OSError:
+            cf_ver = ""
         # remover: auto-desinstalacao pendente — agente executa neste poll e
         # confirma via POST /agente/remover; ate la, tunel nao abre mais
         return {"conectar": bool(c.get("conectar")), "porta": c["porta"],
-                "remover": bool(c.get("remover"))}
+                "remover": bool(c.get("remover")), "cf_versao": cf_ver}
 
 
 def acao_painel(token, cid, acao):
@@ -780,6 +880,36 @@ def _tela_http(cid, pedido, corpo=b""):
             return b""
 
 
+def _tela_get(cid, pedido, corpo=b""):
+    """GET/POST com corpo de resposta de verdade no listener do cliente
+    (HTTP/1.1 + Connection: close: http.sys fecha o socket no fim, então
+    ler até o EOF devolve a resposta inteira). Devolve (status, corpo);
+    corpo limitado a 1 MB (clipboard de texto não passa disso)."""
+    cab = ("%s %s HTTP/1.1\r\nHost: localhost:28090\r\n"
+           "Content-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\n"
+           "Connection: close\r\n\r\n" % (
+               "POST" if corpo else "GET", pedido, len(corpo)))
+    with socket.create_connection(("127.0.0.1", _tela_porta_local(cid)), timeout=6) as s:
+        s.sendall(cab.encode() + corpo)
+        s.settimeout(6)
+        pedaco = s.recv(65536)
+        buf = bytearray(pedaco)
+        while pedaco and len(buf) < 1048576:
+            try:
+                pedaco = s.recv(65536)
+            except OSError:
+                break
+            buf += pedaco
+    if not buf:
+        raise OSError("listener não respondeu")
+    cab_, _, corpo_ = bytes(buf).partition(b"\r\n\r\n")
+    try:
+        status = int(cab_.split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        raise OSError("resposta sem status: %r" % bytes(cab_[:60]))
+    return status, corpo_
+
+
 # ---------------- instaladores ----------------
 
 def bloco_curl_b64(destino):
@@ -799,7 +929,7 @@ def bloco_curl_b64(destino):
         arq_b64 = "%s\\%s.b64" % (destino, nome)
         for i in range(0, len(b64), 4000):        # linha cmd tem limite de 8191
             linhas.append('%s "%s" echo %s' % (">" if i == 0 else ">>", arq_b64, b64[i:i + 4000]))
-        linhas.append('certutil -decode "%s" "%s\\%s" >nul' % (arq_b64, destino, nome))
+        linhas.append('certutil -decode -f "%s" "%s\\%s" >nul' % (arq_b64, destino, nome))
         linhas.append('del "%s" >nul 2>&1' % arq_b64)
     return linhas
 
@@ -815,6 +945,21 @@ def cmds_cliente_b64(nome, bom=False):
     return base64.b64encode(t.encode("utf-8")).decode()
 
 
+def bloco_echo_b64(destino, dados):
+    """Base64 de um arquivo em blocos de `echo` de 4 KB. O cmd tem limite de
+    8191 chars por linha: um echo único com o agente.ps1 inteiro (8.216 chars
+    após o auto-update) era TRUNCADO, o certutil decodificava um agente.ps1
+    cortado e a tarefa agendada morria sem pollar (visto em campo no
+    adjundiai39). O primeiro chunk entra inline no template, o resto vem em
+    linhas >> próprias."""
+    b64 = base64.b64encode(dados).decode()
+    linhas = []
+    for i in range(0, len(b64), 4000):
+        pref = "" if not linhas else ('>> "%s" echo ' % destino)
+        linhas.append(pref + b64[i:i + 4000])
+    return "\n".join(linhas)
+
+
 def gerar_instalador_agente(linux):
     """Renderiza o instalador do agente permanente (um arquivo só)."""
     if linux:
@@ -826,8 +971,8 @@ def gerar_instalador_agente(linux):
     des = render("desinstalar.ps1", {"__URL_BASE__": URL_BASE})
     bat = render("template-agente.bat", {"__URL_BASE__": URL_BASE, "__DOMINIO__": DOMINIO,
                                          "__PORTA_PROXY__": str(PORTA_PROXY),
-                                         "__AGENTE_PS1_B64__": base64.b64encode(ps1.encode()).decode(),
-                                         "__DESINSTALAR_PS1_B64__": base64.b64encode(des.encode()).decode(),
+                                         "__AGENTE_PS1_B64__": bloco_echo_b64("%DIR%\\b64.tmp", ps1.encode()),
+                                         "__DESINSTALAR_PS1_B64__": bloco_echo_b64("%DIR%\\b64.tmp", des.encode()),
                                          "__MSG_CMD_B64__": cmds_cliente_b64("suporte-mensagem.cmd"),
                                          "__PERG_CMD_B64__": cmds_cliente_b64("suporte-pergunta.cmd"),
                                          "__PERG_PS1_B64__": cmds_cliente_b64("suporte-pergunta-run.ps1", bom=True),
@@ -878,6 +1023,138 @@ PAGINA_LOGIN = """<!doctype html><meta charset=utf-8>
         autocomplete=current-password required></label>
  <button>Entrar</button>
 </form>"""
+
+PAGINA_2FA = """<!doctype html><meta charset=utf-8>
+<title>Suporte Remoto — código 2FA</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+ body{font-family:system-ui,sans-serif;background:#111;color:#eee;display:flex;
+      justify-content:center;align-items:center;min-height:100vh;margin:0}
+ form{background:#1b1b1b;padding:2rem;border-radius:8px;width:min(320px,90vw)}
+ h2{margin:0 0 1rem;font-size:1.1rem}
+ input{width:100%;box-sizing:border-box;padding:8px;margin:4px 0 12px;
+       border:1px solid #333;border-radius:4px;background:#111;color:#eee;
+       letter-spacing:2px;font-size:18px;text-align:center}
+ button{width:100%;padding:9px;cursor:pointer;border:0;border-radius:4px;
+        background:#3c8;color:#041;font-weight:600}
+ .erro{color:#c66;margin-bottom:12px;font-size:14px;min-height:1em}
+ .dica{color:#888;font-size:13px;margin-bottom:8px}
+</style>
+<form method=post action=/painel/2fa>
+ <h2>🔒 Autenticação em 2 fatores</h2>
+ <div class=erro>__ERRO__</div>
+ <label>Código do app autenticador
+  <input name=codigo inputmode=numeric autocomplete=one-time-code
+         maxlength=10 autofocus required></label>
+ <div class=dica>Código de 6 dígitos — ou um código de recuperação.</div>
+ <input type=hidden name=pre value="__PRE__">
+ <button>Verificar</button>
+</form>"""
+
+
+def pagina_2fa_setup(msg="", erro="", codigos=None):
+    """Página de ativação/gestão do 2FA (exige sessão do painel)."""
+    d2 = carregar_2fa() or novo_2fa()
+    ativo = bool(d2.get("ativo"))
+    usuario = (carregar().get("login") or {}).get("usuario") or "tecnico"
+    issuer = quote("Suporte Remoto")
+    uri = ("otpauth://totp/%s:%s?secret=%s&issuer=%s"
+           "&algorithm=SHA1&digits=6&period=30"
+           % (issuer, quote(usuario), d2["secret"], issuer))
+    qr = ""
+    try:
+        import qrcode
+        buf = io.BytesIO()
+        qrcode.make(uri, box_size=8, border=2).save(buf, format="PNG")
+        qr = ('<div class=qr><img width=210 height=210 alt="QR do 2FA" '
+              'src="data:image/png;base64,%s"><div class=dica>Leia com a câmera '
+              'do app autenticador — ou <a href="%s">abrir direto no app</a>'
+              '</div></div>'
+              % (base64.b64encode(buf.getvalue()).decode(), uri))
+    except Exception:
+        qr = ""
+    secret = " ".join(d2["secret"][i:i + 4] for i in range(0, len(d2["secret"]), 4))
+    if ativo:
+        acao = """
+ <form method=post action=/painel/2fa/desativar class=inline>
+  <label>Código (TOTP) p/ desativar
+   <input name=codigo inputmode=numeric maxlength=10 required></label>
+  <button class=verm>Desativar 2FA</button>
+ </form>"""
+        status = '<span class="badge on">✅ 2FA ativo</span>'
+        como = ("<p class=dica>Novo acesso: senha + código do app. Restam %d "
+                "código(s) de recuperação (cada um vale uma vez).</p>"
+                % len(d2.get("recuperacao") or []))
+    else:
+        acao = """
+ <form method=post action=/painel/2fa/ativar class=inline>
+  <label>Digite o código atual do app p/ confirmar
+   <input name=codigo inputmode=numeric maxlength=10 required autofocus></label>
+  <button>Ativar 2FA</button>
+ </form>"""
+        status = '<span class="badge off">2FA desativado</span>'
+        como = ""
+    tabela = ""
+    if codigos:
+        linhas = "".join("<code>%s</code>" % c for c in codigos)
+        tabela = ('<div class=rec><b>Códigos de recuperação — guarde agora, '
+                  "são mostrados só esta vez (cada um vale uma vez, no lugar "
+                  "do código do app):</b><div class=cods>%s</div></div>" % linhas)
+    return """<!doctype html><meta charset=utf-8>
+<title>Suporte Remoto — 2FA</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+ body{font-family:system-ui,sans-serif;background:#111;color:#eee;display:flex;
+      justify-content:center;align-items:flex-start;min-height:100vh;margin:0}
+ .box{background:#1b1b1b;padding:1.6rem;border-radius:8px;width:min(420px,92vw);
+      margin-top:6vh}
+ h2{margin:0 0 .8rem;font-size:1.1rem}
+ .box>div,.box>form,.box>p{margin-bottom:1rem}
+ label{font-size:13px;color:#aaa}
+ input{width:100%;box-sizing:border-box;padding:8px;margin:4px 0 12px;
+       border:1px solid #333;border-radius:4px;background:#111;color:#eee;
+       letter-spacing:2px;font-size:18px;text-align:center}
+ button{width:100%;padding:9px;cursor:pointer;border:0;border-radius:4px;
+        background:#3c8;color:#041;font-weight:600}
+ button.verm{background:#c33;color:#fff}
+ .dica{color:#888;font-size:13px}
+ .badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;
+        font-weight:600;margin-bottom:8px}
+ .badge.on{background:#142;color:#5c5;border:1px solid #2c8}
+ .badge.off{background:#3a3a3a;color:#999}
+ .qr{text-align:center;margin-bottom:1rem}
+ .qr img{background:#fff;padding:8px;border-radius:6px}
+ .secret{overflow-wrap:anywhere;color:#5c5;font-size:14px;margin:6px 0}
+ .rec{background:#43330e;border:1px solid #c93;border-radius:6px;padding:10px;
+      font-size:13px}
+ .rec .cods{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+ .rec code{background:#111;padding:4px 8px;border-radius:4px;text-align:center;
+           letter-spacing:1px}
+ .msg{background:#142;border:1px solid #2c8;border-radius:4px;padding:8px 12px;
+      font-size:13px;margin-bottom:1rem}
+ .erro{color:#c66;margin-bottom:12px;font-size:14px;min-height:1em}
+ a.voltar{color:#777;font-size:13px;text-decoration:none;display:block;
+          text-align:center;margin-top:4px}
+</style>
+<div class=box>
+ <h2>🔒 Autenticação em 2 fatores __STATUS__</h2>
+ <div class=erro>__ERRO__</div>
+ <div class=msg>__MSG__</div>
+ __QR__
+ __TABELA__
+ __ACAO__
+ <ol class=dica style="margin:0;padding-left:18px">
+  <li>Instale um app autenticador (Google Authenticator, Microsoft
+      Authenticator, Aegis…)</li>
+  <li>Adicione a conta lendo o QR — ou "Inserir chave de configuração":
+      <div class=secret>__SECRET__</div></li>
+  <li>Confirme com um código do app aqui embaixo</li>
+ </ol>
+ <a class=voltar href=/painel>← voltar ao painel</a>
+</div>""".replace("__STATUS__", status).replace("__ERRO__", erro or "") \
+        .replace("__MSG__", msg or "").replace("__QR__", qr) \
+        .replace("__TABELA__", tabela).replace("__ACAO__", acao) \
+        .replace("__SECRET__", secret)
 
 PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
 <title>Suporte Remoto — clientes</title>
@@ -952,7 +1229,7 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
   td:last-child button:nth-child(5){grid-column:1/-1}
  }
 </style>
-<h2>Clientes instalados <a class=sair href=/painel/sair>sair</a></h2>
+<h2>Clientes instalados <a class=sair href=/painel/2fa/setup title="autenticação em 2 fatores (TOTP)">🔒 2FA</a> <a class=sair href=/painel/sair>sair</a></h2>
 <div id=avisos class="aviso avisos" style=display:none></div>
 <div id=aviso class=aviso style=display:none></div>
 <div style=margin-bottom:10px>
@@ -1154,18 +1431,41 @@ PAGINA_TERMINAL = """<!doctype html><meta charset=utf-8>
       border-radius:6px;font-size:15px}
  #enviarmsg{background:#2c8;border:0;border-radius:6px;padding:10px 16px;color:#041;
             font-weight:600;cursor:pointer}
- #escbtn{background:#333;color:#ccc;border:0;border-radius:6px;padding:10px 12px;
-         cursor:pointer}
+ #escbtn,#imgbtn{background:#333;color:#ccc;border:0;border-radius:6px;
+         padding:10px 12px;cursor:pointer}
+ #imgbtn{font-size:15px;line-height:1;padding:10px 12px}
+ #imgbtn:disabled{opacity:.4;cursor:wait}
+ /* modo seleção: TUIs de tela cheia (claude) capturam o mouse e o arrasto
+    nunca vira seleção — sem mouse de jeito nenhum no celular. O toggle mata
+    os pointer-events do xterm e devolve o texto (DOM real) pra seleção
+    NATIVA do navegador: arraste no desktop, long-press no Android, copiar
+    pelo menu de contexto. Scroll continua na barra lateral #sb. */
+ body.selx #t *{pointer-events:none;user-select:text!important;
+                -webkit-user-select:text!important}
+ #selx{background:#333;color:#ccc;border:0;border-radius:6px;padding:6px 10px;
+       cursor:pointer}
+ body.selx #selx{background:#5a3c8c;color:#fff}
+ /* "carregando conversa…": depois de um restart do servidor o claude relee o
+    histórico inteiro antes de pintar a 1ª tela (conversa grande = muitos
+    segundos de tela preta parada que pareciam travamento — e o F5 no meio
+    dessa janela é o que gerava conversa nova + resume manual) */
+ #ret{position:fixed;top:40px;left:50%;transform:translateX(-50%);
+      background:#5a3c8c;color:#fff;padding:6px 16px;border-radius:0 0 8px 8px;
+      font-size:13px;z-index:9;display:none;pointer-events:none}
 </style>
 <div id=barra><span id=titulo>terminal</span>
  <button id=alt title="trocar entre shell do cliente e claude"></button>
+ <button id=selx title="modo seleção: desliga o mouse do terminal pra selecionar texto com arraste/long-press e copiar nativo com Ctrl+C (o claude captura o mouse e impede a seleção)">✋ selecionar/copiar</button>
  <a class=sair href=/painel>voltar ao painel</a></div>
 <div id=t></div>
+<div id=ret>⚡ carregando conversa… (conversa grande leva alguns segundos — não recarregue)</div>
 <div id=sb><button id=sbUp>▲</button><div id=sbTrack><div id=sbThumb></div></div>
  <button id=sbDn>▼</button></div>
 <div id=chatbar><button id=escbtn title="tecla Esc — interrompe o claude">esc</button>
+ <button id=imgbtn title="mandar print/imagem pro claude — ou cole com Ctrl+V, ou arraste a imagem aqui">📷</button>
  <input id=msg placeholder="mensagem para o claude — Enter envia" autocomplete=off>
- <button id=enviarmsg>enviar</button></div>
+ <button id=enviarmsg>enviar</button>
+ <input type=file id=imginp accept="image/*" hidden></div>
 <script src=/xterm.js></script><script src=/xterm-fit.js></script>
 <script>
 const qs=new URLSearchParams(location.search), cid=qs.get('cid'), s=crypto.randomUUID();
@@ -1193,9 +1493,73 @@ else{
   alt.onclick=()=>location.href='/painel/term?cid='+encodeURIComponent(cid)
     +(modoClaude?'':'&claude=1');
 }
-const term=new Terminal({cursorBlink:true,fontSize:14,theme:{background:'#111'}});
+const term=new Terminal({cursorBlink:true,fontSize:14,theme:{background:'#111'},
+                         rightClickSelectsCopy:true});
 const fit=new FitAddon.FitAddon(); term.loadAddon(fit);
 term.open(document.getElementById('t')); fit.fit();
+// copiar do terminal: Ctrl+C com texto selecionado copia (sem seleção segue
+// sendo interrupt); Ctrl+Shift+C e Ctrl+Ins sempre copiam; clique-direito
+// copia a seleção (rightClickSelectsCopy); botão ⧉ idem. Clipboard API com
+// fallback de textarea pra navegador velho.
+function copiarSel(){
+  const t=term.getSelection();
+  if(!t){ alert('Nada selecionado. No claude, ative o botão ✋ selecionar/copiar, arraste (ou long-press no celular) e use Ctrl+C.'); return; }
+  if(navigator.clipboard&&navigator.clipboard.writeText)
+    navigator.clipboard.writeText(t).catch(()=>fallbackCopiar(t));
+  else fallbackCopiar(t);
+}
+function fallbackCopiar(t){
+  const ta=document.createElement('textarea');
+  ta.value=t; document.body.appendChild(ta); ta.select();
+  try{document.execCommand('copy');}catch(e){}
+  ta.remove();
+}
+term.attachCustomKeyEventHandler(e=>{
+  if(e.type!=='keydown') return true;
+  const k=(e.key||'').toLowerCase();
+  if((e.ctrlKey||e.metaKey)&&k==='c'&&(e.shiftKey||term.hasSelection())){copiarSel();return false;}
+  if((e.ctrlKey||e.metaKey)&&k==='insert'){copiarSel();return false;}
+  return true;
+});
+// modo seleção: enquanto ativo o navegador faz a seleção (nativa), então o
+// ⧉ copiar e o Ctrl+C preferem window.getSelection() — a seleção do xterm
+// segue valendo se existir (modo shell sem o toggle)
+const selx=document.getElementById('selx');
+selx.onclick=()=>{document.body.classList.toggle('selx');
+  selx.title=document.body.classList.contains('selx')
+   ?'modo seleção ATIVO: arraste/long-press seleciona, copie pelo menu ou ⧉; clique de volta para devolver o mouse ao terminal'
+   :'modo seleção: desliga o mouse do terminal pra selecionar texto com arraste/long-press e copiar nativo';};
+function selNativa(){const n=window.getSelection?window.getSelection():null;
+  return n&&n.toString?n.toString().trim():'';}
+// a última seleção nativa viva fica guardada no mouseup/touchend: o Ctrl+C
+// do Android pode chegar depois de o toque ter colapsado a seleção
+let ultimaSelNat='';
+function guardarSelNat(){setTimeout(()=>{const t=selNativa();if(t)ultimaSelNat=t;},0);}
+document.addEventListener('mouseup',guardarSelNat);
+document.addEventListener('touchend',guardarSelNat);
+const copiarSelBase=copiarSel;
+copiarSel=function(){
+  const nat=selNativa()||ultimaSelNat;
+  if(nat){if(navigator.clipboard&&navigator.clipboard.writeText)
+    navigator.clipboard.writeText(nat).catch(()=>fallbackCopiar(nat));
+  else fallbackCopiar(nat); return;}
+  copiarSelBase();
+};
+term.attachCustomKeyEventHandler(e=>{
+  if(e.type!=='keydown') return true;
+  const k=(e.key||'').toLowerCase();
+  if((e.ctrlKey||e.metaKey)&&k==='c'&&(e.shiftKey||term.hasSelection()||selNativa())){copiarSel();return false;}
+  if((e.ctrlKey||e.metaKey)&&k==='insert'){copiarSel();return false;}
+  return true;
+});
+// seleção solta = já copia pra área de transferência (a pedido): o mouseup
+// é user activation, então o clipboard.writeText passa; falha silenciosa
+// (navegador que negar segue copiável pelos outros caminhos)
+term.onSelectionChange(()=>{
+  const t=term.getSelection();
+  if(t&&navigator.clipboard&&navigator.clipboard.writeText)
+    navigator.clipboard.writeText(t).catch(()=>{});
+});
 // digitação: enfileira e envia UM fetch por vez, em ordem — em paralelo os
 // POSTs chegavam fora de ordem e o comando ia embaralhado/cortado no PTY.
 // POST não passa (rede fora ou sessão morta no servidor — web reiniciou,
@@ -1252,6 +1616,67 @@ document.getElementById('msg').addEventListener('keydown',e=>{
   if(e.key==='Enter'){e.preventDefault();enviarMsg();}
 });
 document.getElementById('escbtn').addEventListener('click',()=>{fila.push('\\x1b');bombear();});
+// prints de tela pro claude: 📷 / Ctrl+V / arrastar → upload → a mensagem
+// cita o caminho salvo no servidor; o claude abre o arquivo com a
+// ferramenta Read e passa a "ver" a imagem. Reduz a no máx 1800px no
+// navegador (print de celular sai de 3-8 MB; 1800 mantém o texto legível)
+if(modoClaude){
+const ib=document.getElementById('imgbtn'), ii=document.getElementById('imginp'),
+      inp2=document.getElementById('msg');
+function stImg(t,ruim){inp2.placeholder=t;
+  inp2.style.background=ruim?'#3a1119':'#111';inp2.style.color=ruim?'#f88':'#eee';}
+function stImgLimpa(){stImg('mensagem para o claude — Enter envia');}
+async function reduzirImg(b){
+  try{
+    const bmp=await createImageBitmap(b), m=Math.max(bmp.width,bmp.height);
+    if(m<=1800){bmp.close&&bmp.close();return b;}
+    const k=1800/m, c=document.createElement('canvas');
+    c.width=Math.round(bmp.width*k);c.height=Math.round(bmp.height*k);
+    c.getContext('2d').drawImage(bmp,0,0,c.width,c.height);
+    bmp.close&&bmp.close();
+    return (await new Promise(r=>c.toBlob(r,'image/png')))||b;
+  }catch(e){return b;}
+}
+async function enviarImagem(arq){
+  if(morto){stImg('⚠ sessão caiu — F5 retoma e tente de novo',1);return;}
+  if(!arq||!String(arq.type||'').startsWith('image/')){
+    stImg('arquivo não é imagem',1);setTimeout(stImgLimpa,2500);return;}
+  ib.disabled=true;stImg('enviando print…');
+  try{
+    const b=await reduzirImg(arq);
+    const b64=await new Promise((ok,ruim)=>{const fr=new FileReader();
+      fr.onload=()=>ok(fr.result.split(',')[1]);fr.onerror=ruim;fr.readAsDataURL(b);});
+    const r=await fetch('/painel/term/imagem?s='+s+'&cid='+encodeURIComponent(cid),
+      {method:'POST',headers:{'Content-Type':'application/json'},
+       body:JSON.stringify({b64:b64})});
+    const j=await r.json();
+    if(!j||!j.ok||!j.arq) throw new Error((j&&j.erro)||('HTTP '+r.status));
+    stImg('print enviado ✓');
+    inp2.value='print de tela: '+j.arq+' (abra com a ferramenta Read para ver)';
+    enviarMsg();
+    setTimeout(stImgLimpa,1500);
+  }catch(e){
+    stImg('falha no envio ('+e+')',1);setTimeout(stImgLimpa,4000);
+  }
+  ib.disabled=false;
+}
+ib.onclick=()=>ii.click();
+ii.onchange=()=>{if(ii.files[0])enviarImagem(ii.files[0]);ii.value='';};
+// Ctrl+V de imagem (Win+Shift+S → colar): intercepta SÓ quando o clipboard
+// traz arquivo de imagem — texto cola normal no input
+document.addEventListener('paste',e=>{
+  if(!e.clipboardData)return;
+  for(const it of e.clipboardData.items)
+    if(it.kind==='file'&&it.type.startsWith('image/')){
+      e.preventDefault();enviarImagem(it.getAsFile());return;
+    }
+});
+// arrastar uma imagem pra cima do terminal
+const tEl=document.getElementById('t');
+tEl.addEventListener('dragover',e=>e.preventDefault());
+tEl.addEventListener('drop',e=>{e.preventDefault();
+  const f=e.dataTransfer&&e.dataTransfer.files[0];if(f)enviarImagem(f);});
+}
 term.onResize(({cols,rows})=>fetch('/painel/term/size?s='+s+'&cid='+encodeURIComponent(cid),
   {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cols,rows})}));
 window.addEventListener('resize',()=>fit.fit());
@@ -1399,6 +1824,11 @@ addEventListener('pagehide',()=>{
     term.write('\\r\\n<< stream não conectou ('+e+') — atualize a página (F5) >>');return;
   }
   if(!r.ok){term.write('\\r\\n<< '+(await r.text()).trim()+' >>');return;}
+  // claude conectado mas mudo = lendo o histórico (resume): avisa em vez de
+  // tela preta; some no 1º byte que o PTY cuspir
+  let retAviso=false;
+  if(modoClaude){retAviso=true;document.getElementById('ret').style.display='block';
+    setTimeout(()=>{if(retAviso)document.getElementById('ret').style.opacity='.6';},4000);}
   fit.fit();
   if(modoClaude) document.getElementById('msg').focus(); else focar();
   fetch('/painel/term/size?s='+s+'&cid='+encodeURIComponent(cid),{method:'POST',
@@ -1409,11 +1839,13 @@ addEventListener('pagehide',()=>{
   const t0=Date.now();
   try{
     while(true){const {done,value}=await rd.read();if(done)break;
+      if(retAviso){retAviso=false;document.getElementById('ret').style.display='none';}
       term.write(dec.decode(value,{stream:true}));}
   }catch(e){}
   // retomada que morre na hora = conversa irretomável: limpa o uuid pra o
   // próximo F5 nascer limpo em vez de insistir no --resume quebrado
   if(modoClaude&&retomar&&Date.now()-t0<5000){
+    if(retAviso)document.getElementById('ret').style.display='none';
     sessionStorage.removeItem('claude-sess-'+cid);
     term.write('\\r\\n<< conversa não pôde ser retomada — F5 abre uma nova >>');
   } else term.write(modoClaude
@@ -1431,46 +1863,73 @@ addEventListener('pagehide',()=>{
 
 PAGINA_TELA = """<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>tela — __CID__</title>
+<title>tela — __NOME__</title>
 <style>
  body{margin:0;background:#0d0f14;color:#eee;font-family:system-ui,sans-serif;
       display:flex;flex-direction:column;height:100vh}
- #barra{display:flex;align-items:center;gap:8px;padding:8px 12px;
-        background:#151923;border-bottom:1px solid #222;flex-wrap:wrap}
- #barra .id{font-weight:600;font-size:14px}
- #st{font-size:12px;color:#8f9}
+ #barra{display:flex;align-items:center;gap:6px;padding:6px 10px;
+        background:#151923;border-bottom:1px solid #222;flex-wrap:wrap;
+        transition:opacity .25s,transform .25s;z-index:5}
+ #barra .id{font-weight:600;font-size:14px;margin-right:2px}
+ #st{font-size:12px;color:#8f9;min-width:120px}
  #st.err{color:#f66}
- button{border:0;border-radius:4px;padding:6px 12px;font-size:13px;cursor:pointer}
+ button,select{border:0;border-radius:4px;padding:6px 10px;font-size:13px;
+        cursor:pointer;background:#232a3a;color:#9ab}
+ button:disabled{opacity:.4;cursor:not-allowed}
  #ctl{background:#26304a;color:#fff}
  #ctl.on{background:#a33;color:#fff;font-weight:600}
  #parar{background:#8a2626;color:#fff}
  #voltar{background:#232a3a;color:#9ab}
+ select{color:#cdd}
  #palco{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;
-        position:relative;overflow:hidden}
+        position:relative;overflow:hidden;background:#07080c}
  #tela{max-width:100%;max-height:100%;user-select:none;-webkit-user-drag:none}
  #tela.controle{cursor:crosshair;outline:2px solid #a33}
  #cursor{position:absolute;pointer-events:none;display:none;color:#f46;
          font-weight:700;font-size:22px;line-height:1;
          transform:translate(-50%,-50%);text-shadow:0 0 4px #000;z-index:2}
- #dica{font-size:11px;color:#667;padding:6px 12px;text-align:center}
+ #dica{font-size:11px;color:#667;padding:5px 12px;text-align:center}
+ /* tela cheia: a barra vira overlay no topo e some sozinha (AnyDesk-like) */
+ body:fullscreen #barra{position:fixed;left:0;right:0;top:0;
+        background:rgba(21,25,35,.94)}
+ body.sembarra #barra{opacity:0;pointer-events:none;transform:translateY(-100%)}
+ @media (max-width:700px){ #st{display:none} }
 </style>
 <div id=barra>
- <button id=voltar title="voltar pra lista de PCs">← PCs</button>
- <span class=id>tela — __CID__</span>
+ <button id=voltar title="voltar pra lista de PCs">←</button>
+ <span class=id>tela — __NOME__</span>
  <span id=st>conectando…</span>
  <span style="flex:1"></span>
+ <select id=perfil title="qualidade do stream (troca reconecta)">
+  <option value=eco>eco</option>
+  <option value=padrao selected>padrão</option>
+  <option value=fluido>fluido</option>
+ </select>
+ <button id=clipColar title="colar da SUA área de transferência no cliente">⧉ colar</button>
+ <button id=clipCopiar title="copiar a área de transferência do cliente pra cá">⤓ copiar</button>
+ <button id=kWin title="tecla Windows">⊞</button>
+ <button id=kAltTab title="Alt+Tab no cliente">⇄</button>
+ <button id=kTask title="Ctrl+Shift+Esc (Gerenciador de Tarefas)">Task</button>
+ <button id=fs title="tela cheia">⛶</button>
  <button id=ctl>controlar</button>
  <button id=parar>parar</button>
 </div>
 <div id=palco><img id=tela alt="tela do cliente"><div id=cursor>+</div></div>
-<div id=dica>assistindo — clique em "controlar" para mouse e teclado agirem no
-cliente (stream ~2-4 fps; os cliques chegam com um pequeno atraso)</div>
+<div id=dica>assistindo — o quadro inclui o ponteiro do cliente. Clique em
+"controlar" para mouse e teclado agirem no PC do cliente</div>
 <script>
 const cid='__CID__';
 const img=document.getElementById('tela'), st=document.getElementById('st'),
       ctl=document.getElementById('ctl'), cursor=document.getElementById('cursor'),
-      dica=document.getElementById('dica'), palco=document.getElementById('palco');
-let controlando=false;
+      dica=document.getElementById('dica'), palco=document.getElementById('palco'),
+      perfilSel=document.getElementById('perfil');
+let controlando=false, temClip=null;
+
+// perfis de qualidade: w=largura q=jpeg i=intervalo(ms) — viajam na query
+// do /stream até o listener do cliente (página fraca = eco etc.)
+const PERFIS={eco:{w:960,q:40,i:500},padrao:{w:1280,q:52,i:150},
+              fluido:{w:1152,q:46,i:80}};
+const perfil=()=>PERFIS[perfilSel.value]||PERFIS.padrao;
 
 // fila serial (um fetch por vez — mesmo padrão do terminal) com
 // coalescência: um move pendente é substituído pelo mais novo. Evento SEM
@@ -1495,7 +1954,7 @@ async function bombear(){
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify(Object.assign({cid:cid},ev))});
       if(r.status===502){ st.textContent='tela caiu — reconectando…';
-                          st.className='err'; img.src=novaConexao(); }
+                          st.className='err'; reconectar(); }
       else if(r.status===504) repondo=true;
     }catch(e){ repondo=true; }
     if(repondo && ev.t!=='move' && (ev.n=(ev.n||0)+1)<3){
@@ -1508,8 +1967,17 @@ async function bombear(){
 let rede=0,watchdog=0;
 function novaConexao(){
   rede=Date.now();
-  return '/painel/tela/stream?cid='+encodeURIComponent(cid)+'&r='+rede;
+  const p=perfil();
+  return '/painel/tela/stream?cid='+encodeURIComponent(cid)+
+         '&r='+rede+'&w='+p.w+'&q='+p.q+'&i='+p.i;
 }
+// troca de perfil: solta o stream ATUAL primeiro — reconectar com o viewer
+// velho ainda pendurado no listener dava 409 (um viewer por vez)
+function reconectar(){
+  img.removeAttribute('src');
+  setTimeout(()=>{ img.src=novaConexao(); arma(); },700);
+}
+perfilSel.onchange=reconectar;
 img.onload=()=>{ st.textContent='ao vivo'; st.className=''; tentativas=0;
                  clearTimeout(watchdog); };
 // erro cedo (subida lenta, viewer em outra aba, listener morto): sem isto
@@ -1536,6 +2004,22 @@ function arma(){
 }
 img.onerror=semSinal;
 img.src=novaConexao(); arma();
+
+// status ao vivo: fps/kbps medidos pelo próprio cliente (janela de ~2s)
+setInterval(async()=>{
+  try{
+    const r=await fetch('/painel/tela/info?cid='+encodeURIComponent(cid));
+    if(!r.ok) throw 0;
+    const j=await r.json();
+    if(temClip===null && j.clip===0){
+      document.getElementById('clipColar').style.display='none';
+      document.getElementById('clipCopiar').style.display='none';
+    }
+    temClip=j.clip;
+    if(!controlando){ st.textContent='ao vivo · '+j.fps+' fps · '+j.kbps+' KB/s';
+                      st.className=''; }
+  }catch(e){}
+},2500);
 
 // ---- entrada: coordenadas normalizadas (0..1) casam com o desktop
 // virtual do cliente mesmo com a captura reduzida ----
@@ -1578,18 +2062,21 @@ palco.addEventListener('wheel',e=>{
 },{passive:false});
 
 // teclado: F5/F12 e ctrl+r ficam no navegador; o resto vai pro cliente.
-// caractere vai como unicode (acentos ok); ctrl/alt+letra vira VK no .ps1
+// caractere vai como unicode (acentos ok); ctrl/alt+letra vira VK no cliente;
+// ctrl+alt+caractere = AltGr (layout pt-BR digita @ # $ de verdade)
 const NOME={Enter:1,Backspace:1,Tab:1,Escape:1,Delete:1,Insert:1,Home:1,End:1,
-            PageUp:1,PageDown:1,ArrowLeft:1,ArrowUp:1,ArrowRight:1,ArrowDown:1};
+            PageUp:1,PageDown:1,ArrowLeft:1,ArrowUp:1,ArrowRight:1,ArrowDown:1,
+            Meta:1,ContextMenu:1};
 document.addEventListener('keydown',e=>{
   if(!controlando) return;
   if(e.key==='F5'||e.key==='F12'||(e.ctrlKey&&e.key.toLowerCase()==='r')) return;
   if(NOME[e.key]||/^F([1-9]|1[0-2])$/.test(e.key)){
     e.preventDefault();
-    enviar({t:'key',k:e.key,ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey});
+    enviar({t:'key',k:e.key,ctrl:e.ctrlKey,alt:e.altKey,meta:e.metaKey,
+            shift:e.shiftKey});
   }else if(e.key.length===1){
     e.preventDefault();
-    enviar({t:'key',c:e.key,ctrl:e.ctrlKey,alt:e.altKey});
+    enviar({t:'key',c:e.key,ctrl:e.ctrlKey,alt:e.altKey,meta:e.metaKey});
   }
 });
 
@@ -1610,6 +2097,55 @@ ctl.onclick=()=>{
     dica.textContent='assistindo — controle desligado';
   }
 };
+
+// ---- atalhos de tecla (barra) ----
+const atalho=(id,ev)=>{ document.getElementById(id).onclick=()=>{
+  if(!controlando){ alert('Ative "controlar" primeiro.'); return; }
+  enviar(ev);
+};};
+atalho('kWin',{t:'key',k:'Meta'});
+atalho('kAltTab',{t:'key',k:'Tab',alt:true});
+atalho('kTask',{t:'key',k:'Escape',ctrl:true,shift:true});
+
+// ---- clipboard de texto (AnyDesk-like) ----
+document.getElementById('clipColar').onclick=async()=>{
+  let txt=null;
+  try{ txt=await navigator.clipboard.readText(); }
+  catch(e){ txt=prompt('Texto pra colar no cliente:'); }
+  if(!txt) return;
+  const r=await fetch('/painel/tela/clip',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cid:cid,texto:txt})});
+  st.textContent=r.ok?('⧉ '+txt.length+' chars no clipboard do cliente')
+                     :'clipboard falhou';
+  setTimeout(()=>{ if(!controlando) st.textContent='ao vivo'; },2500);
+};
+document.getElementById('clipCopiar').onclick=async()=>{
+  try{
+    const r=await fetch('/painel/tela/clip?cid='+encodeURIComponent(cid));
+    if(!r.ok) throw 0;
+    const txt=await r.text();
+    try{ await navigator.clipboard.writeText(txt); st.textContent='⤓ copiado'; }
+    catch(e){ prompt('Copie com Ctrl+C:',txt); }
+  }catch(e){ st.textContent='clipboard do cliente indisponível'; }
+  setTimeout(()=>{ if(!controlando) st.textContent='ao vivo'; },2500);
+};
+
+// ---- tela cheia com barra que some ----
+let fsTimer=0;
+function barraAuto(){
+  document.body.classList.remove('sembarra');
+  clearTimeout(fsTimer);
+  if(document.fullscreenElement)
+    fsTimer=setTimeout(()=>document.body.classList.add('sembarra'),2500);
+}
+document.getElementById('fs').onclick=()=>{
+  if(document.fullscreenElement) document.exitFullscreen();
+  else document.body.requestFullscreen().catch(()=>{});
+};
+document.addEventListener('fullscreenchange',barraAuto);
+document.addEventListener('mousemove',()=>{ if(document.fullscreenElement) barraAuto(); });
+
 document.getElementById('voltar').onclick=()=>location.href='/painel';
 document.getElementById('parar').onclick=async()=>{
   await fetch('/painel/tela/parar',{method:'POST',
@@ -1660,13 +2196,18 @@ class Handler(BaseHTTPRequestHandler):
             if self._sessao():
                 self._html(PAGINA_PAINEL)
             elif hmac.compare_digest((qs.get("token") or [""])[0], carregar()["token_painel"]):
-                # bookmark antigo com ?token= valida uma vez e vira sessão de cookie
-                self._redirect("/painel", nova_sessao())
+                # bookmark antigo com ?token=: com 2FA ativo o token vale como
+                # fator 1 e o código do app fecha a entrada; sem 2FA vira
+                # sessão de cookie direto como antes
+                if self._2fa_ativo():
+                    self._html(PAGINA_2FA.replace("__ERRO__", "")
+                               .replace("__PRE__", _pre_2fa()))
+                else:
+                    self._redirect("/painel", nova_sessao())
             else:
                 self._html(PAGINA_LOGIN.replace("__ERRO__", ""))
         elif rota == "/painel/dados":
-            if self._sessao() or hmac.compare_digest((qs.get("token") or [""])[0],
-                                                     carregar()["token_painel"]):
+            if self._sessao() or self._token_ok((qs.get("token") or [""])[0]):
                 self._json(dados_painel())
             else:
                 self._erro(403, "sessao expirada — entre de novo")
@@ -1676,6 +2217,11 @@ class Handler(BaseHTTPRequestHandler):
                 SESSOES.pop(sid, None)
                 _salvar_sessoes()
             self._redirect("/painel", expira=True)
+        elif rota == "/painel/2fa/setup":
+            if not self._sessao():
+                self._redirect("/painel")
+            else:
+                self._html(pagina_2fa_setup())
         elif rota in ("/xterm.js", "/xterm.css", "/xterm-fit.js"):
             self._static(rota.lstrip("/"))
         elif rota.startswith("/arquivos/"):
@@ -1688,7 +2234,46 @@ class Handler(BaseHTTPRequestHandler):
                 self._erro(404, "arquivo desconhecido")
         elif rota == "/hbcd":
             # atalho direto pra ISO do WinPE so-Chrome (build: winpe/work/)
-            self._arquivo("HBCD-PE-Chrome-v1.0.9.iso")
+            self._arquivo("HBCD-PE-Chrome-v1.0.10.iso")
+        elif rota.startswith("/wpecmd/"):
+            # canal de comando do modo WinPE (fallback quando o sshd do PE
+            # nao sobe): o loop do bat busca /wpecmd/<token>, executa e
+            # devolve a saida por /wpebeacon. Token rendado no
+            # winpe/wpe-token.txt pelo gerar-winpe.sh — so o bat atual fala
+            # por aqui. Comando e one-shot: serviu, ja era.
+            tok = rota[len("/wpecmd/"):]
+            try:
+                with open(os.path.join(BASE, "wpe-token.txt")) as f:
+                    bom = f.read().strip()
+            except OSError:
+                bom = ""
+            if not bom or not hmac.compare_digest(tok, bom):
+                self._erro(403, "token invalido")
+                return
+            try:
+                with open(os.path.join(BASE, "wpe-cmd.txt")) as f:
+                    cmd = f.read().strip()
+            except OSError:
+                cmd = ""
+            if cmd:
+                try:
+                    with open(os.path.join(BASE, "wpe-beacons.log"), "a") as f:
+                        f.write("%s CMD-SERVIDO %s\n" % (agora(), cmd[:300]))
+                    open(os.path.join(BASE, "wpe-cmd.txt"), "w").close()
+                except OSError:
+                    pass
+            self._text(cmd or "vazio")
+        elif rota.startswith("/wpebeacon/"):
+            # beacon do instalador WinPE: cada passo do suporte-winpe.bat
+            # "canta" aqui — mesmo morrendo em silêncio na máquina, a gente
+            # vê o último passo vivo e os logs de debug no wpe-beacons.log
+            try:
+                with open(os.path.join(BASE, "wpe-beacons.log"), "a") as f:
+                    f.write("%s %s\n" % (agora(),
+                                         unquote(rota[len("/wpebeacon/"):])[:4000]))
+            except OSError:
+                pass
+            self._erro(404, "ok")
         elif rota == "/favicon.ico":        # evita 404 no console do navegador
             self.send_response(204)
             self.send_header("Content-Length", "0")
@@ -1734,15 +2319,44 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/painel")
                 return
             cid = (qs.get("cid") or [""])[0]
-            if cid not in carregar()["clientes"]:
+            reg = carregar()
+            if cid not in reg["clientes"]:
                 self._erro(404, "cliente desconhecido")
                 return
-            self._html(PAGINA_TELA.replace("__CID__", cid))
+            self._html(PAGINA_TELA.replace("__CID__", cid)
+                       .replace("__NOME__", html_escape(reg["clientes"][cid].get("nome") or cid)))
         elif rota == "/painel/tela/stream":
             if not self._term_auth(qs):
                 self._erro(403, "sessao expirada — entre de novo")
                 return
             self._stream_tela((qs.get("cid") or [""])[0])
+        elif rota in ("/painel/tela/info", "/painel/tela/clip"):
+            # relays pequenos da página da tela: stats do stream (fps/kbps)
+            # e clipboard de texto do cliente — mesmas checagens do stream
+            if not self._term_auth(qs):
+                self._erro(403, "sessao expirada — entre de novo")
+                return
+            cid = (qs.get("cid") or [""])[0]
+            if cid not in carregar()["clientes"]:
+                self._erro(404, "cliente desconhecido")
+                return
+            try:
+                st, corpo = _tela_get(cid, "/info" if rota.endswith("/info") else "/clip")
+            except (OSError, KeyError) as exc:
+                self._erro(502, "tela fora do ar: %s" % exc)
+                return
+            if st != 200:
+                self._erro(502, "cliente: %s" % corpo.decode("utf-8", "replace")[:200])
+                return
+            if rota.endswith("/info"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(corpo)))
+                self.end_headers()
+                self.wfile.write(corpo)
+            else:
+                self._text(corpo.decode("utf-8", "replace"))
         else:
             self._erro(404, "rota desconhecida")
 
@@ -1754,10 +2368,77 @@ class Handler(BaseHTTPRequestHandler):
             form = parse_qs(self.rfile.read(n).decode())
             senha = (form.get("senha") or [""])[0]
             if senha_ok(carregar(), senha):
-                self._redirect("/painel", nova_sessao())
+                if self._2fa_ativo():
+                    # senha certa: fator 1 ok, falta o código do app
+                    self._html(PAGINA_2FA.replace("__ERRO__", "")
+                               .replace("__PRE__", _pre_2fa()))
+                else:
+                    self._redirect("/painel", nova_sessao())
             else:
                 time.sleep(0.5)   # freia tentativa de força bruta
                 self._html(PAGINA_LOGIN.replace("__ERRO__", "Usuário ou senha incorretos."), 401)
+            return
+        if rota in ("/painel/2fa", "/painel/2fa/ativar", "/painel/2fa/desativar"):
+            n = int(self.headers.get("Content-Length") or 0)
+            form = parse_qs(self.rfile.read(n).decode())
+            codigo = (form.get("codigo") or [""])[0]
+            d2 = carregar_2fa() or {}
+            if rota == "/painel/2fa":
+                # segundo passo do login: pre-token (senha/token já validados)
+                pre = (form.get("pre") or [""])[0]
+                exp = _2FA_PRE.get(pre)
+                if exp is None or datetime.now() > exp:
+                    self._html(PAGINA_LOGIN.replace("__ERRO__",
+                               "Verificação expirada — entre de novo."), 401)
+                    return
+                ip = self.client_address[0]
+                tent = _2FA_TENTATIVAS.setdefault(ip, [])
+                tent[:] = [t for t in tent if time.time() - t < 600]
+                if len(tent) >= _2FA_MAX_TENT:
+                    time.sleep(0.5)
+                    self._html(PAGINA_2FA.replace("__ERRO__",
+                               "Muitas tentativas — aguarde alguns minutos.")
+                               .replace("__PRE__", pre), 429)
+                    return
+                if not (totp_ok(d2.get("secret") or "", codigo)
+                        or recuperacao_ok(d2, codigo)):
+                    tent.append(time.time())
+                    time.sleep(0.5)
+                    self._html(PAGINA_2FA.replace("__ERRO__", "Código incorreto.")
+                               .replace("__PRE__", pre), 401)
+                    return
+                _2FA_PRE.pop(pre, None)
+                _2FA_TENTATIVAS.pop(ip, None)
+                self._redirect("/painel", nova_sessao())
+                return
+            # ativar/desativar: exige sessão do painel (já passou pelo 2FA
+            # se ativo — desativar pede o código de novo por garantia)
+            if not self._sessao():
+                raise PermissionError("sem sessão")
+            if not d2:
+                self._html(pagina_2fa_setup(erro="2FA não configurado"))
+                return
+            if rota == "/painel/2fa/ativar":
+                if not totp_ok(d2["secret"], codigo):
+                    time.sleep(0.5)
+                    self._html(pagina_2fa_setup(
+                        erro="Código incorreto — confira o app e tente de novo."))
+                    return
+                d2["ativo"] = True
+                codigos = _novas_recuperacoes(d2)
+                self._html(pagina_2fa_setup(
+                    msg="✅ 2FA ATIVADO — a partir de agora o painel pede "
+                        "senha + código do app.", codigos=codigos))
+                return
+            # desativar
+            if not totp_ok(d2["secret"], codigo):
+                time.sleep(0.5)
+                self._html(pagina_2fa_setup(erro="Código incorreto."))
+                return
+            d2["ativo"] = False
+            salvar_2fa(d2)
+            self._html(pagina_2fa_setup(
+                msg="2FA desativado — o painel volta a pedir só a senha."))
             return
         # /painel/term/in manda bytes crus (teclas do xterm); o resto é JSON
         corpo = {} if rota == "/painel/term/in" else self._corpo_json()
@@ -1770,20 +2451,20 @@ class Handler(BaseHTTPRequestHandler):
         elif rota == "/painel/acao":
             if self._sessao():
                 self._text(acao_autorizada(corpo.get("id", ""), corpo.get("acao", "")))
-            else:
+            elif self._token_ok(corpo.get("token", "")):
                 self._text(acao_painel(corpo.get("token", ""), corpo.get("id", ""),
                                        corpo.get("acao", "")))
+            else:
+                raise PermissionError("token invalido")
         elif rota == "/painel/nome":
-            if not self._sessao() and not hmac.compare_digest(
-                    corpo.get("token", ""), carregar()["token_painel"]):
+            if not self._sessao() and not self._token_ok(corpo.get("token", "")):
                 raise PermissionError("token invalido")
             self._text(renomear(corpo.get("id", ""), corpo.get("nome", "")))
         elif rota == "/painel/tela/in":
             # evento de mouse/teclado da página da tela: {"cid", "t": ...}
             ev = dict(corpo)
             cid = ev.pop("cid", "")
-            if not self._sessao() and not hmac.compare_digest(
-                    ev.pop("token", ""), carregar()["token_painel"]):
+            if not self._sessao() and not self._token_ok(ev.pop("token", "")):
                 self._erro(403, "sem sessão")
                 return
             if not cid or cid not in carregar()["clientes"]:
@@ -1806,8 +2487,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
         elif rota == "/painel/tela/parar":
             cid = corpo.get("cid", "")
-            if not self._sessao() and not hmac.compare_digest(
-                    corpo.get("token", ""), carregar()["token_painel"]):
+            if not self._sessao() and not self._token_ok(corpo.get("token", "")):
                 self._erro(403, "sem sessão")
                 return
             if not cid:
@@ -1815,6 +2495,25 @@ class Handler(BaseHTTPRequestHandler):
                 return
             threading.Thread(target=_tela_parar, args=(cid,), daemon=True).start()
             self._json({"ok": True})
+        elif rota == "/painel/tela/clip":
+            # colar texto do técnico na área de transferência DO CLIENTE
+            cid = corpo.get("cid", "")
+            if not self._sessao() and not self._token_ok(corpo.get("token", "")):
+                self._erro(403, "sem sessão")
+                return
+            if not cid or cid not in carregar()["clientes"]:
+                self._erro(400, "cid ausente ou inválido")
+                return
+            texto = str(corpo.get("texto") or "")[:1048576]
+            try:
+                st, r = _tela_get(cid, "/clip", texto.encode("utf-8"))
+            except (OSError, KeyError) as exc:
+                self._erro(502, "tela fora do ar: %s" % exc)
+                return
+            if st != 204:
+                self._erro(502, "cliente: %s" % r.decode("utf-8", "replace")[:200])
+                return
+            self._json({"ok": True, "chars": len(texto)})
         elif rota == "/painel/verificar":
             # botão "procurar atualização" do painel: consulta o GitHub na hora
             # (a checagem automática roda a cada 6h desde o boot)
@@ -1840,6 +2539,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._term_auth(qs):
                     raise PermissionError("sem sessão")
                 self._term_io(qs, self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            elif rota == "/painel/term/imagem":
+                if not self._term_auth(qs):
+                    raise PermissionError("sem sessão")
+                self._term_imagem(qs, corpo)
             elif rota == "/painel/term/size":
                 if not self._term_auth(qs):
                     raise PermissionError("sem sessão")
@@ -1874,11 +2577,24 @@ class Handler(BaseHTTPRequestHandler):
     def _stream_tela(self, cid):
         """Relay do MJPEG do cliente: na 1ª conexão sobe o tela.ps1 e o ssh -L
         (tela.sh), depois repassa os bytes do listener pro navegador até a
-        aba fechar. Um viewer por cliente (o listener também recusa o 2º)."""
+        aba fechar. Um viewer por cliente (o listener também recusa o 2º).
+        A query ?w=&q=&i= (perfil de qualidade da página) viaja inteira até
+        o listener do cliente."""
         reg = carregar()
         if cid not in reg["clientes"]:
             self._erro(404, "cliente desconhecido")
             return
+        qs = parse_qs(urlsplit(self.path).query)
+
+        def _int(nome, padrao, lo, hi):
+            try:
+                return min(hi, max(lo, int((qs.get(nome) or [str(padrao)])[0])))
+            except ValueError:
+                return padrao
+
+        perfil = "w=%d&q=%d&i=%d" % (_int("w", 1280, 640, 1920),
+                                     _int("q", 52, 30, 80),
+                                     _int("i", 150, 60, 1000))
         t = TELAS.get(cid)
         if t and t["ativos"] > 0:
             self._erro(409, "tela já aberta em outra aba")
@@ -1889,11 +2605,11 @@ class Handler(BaseHTTPRequestHandler):
         sock = None
         try:
             try:
-                r = _tela_http(cid, "/info")      # encaminhamento no ar?
+                st, r = _tela_get(cid, "/info")   # encaminhamento no ar?
                 # resposta vazia/lixo = forward zombie apontando pra listener
                 # morto: sem isto o probe "passa" e o relay entrega 200 sem
                 # um unico quadro (pagina carregando pra sempre)
-                if not r.strip().startswith(b"{"):
+                if st != 200 or not r.strip().startswith(b"{"):
                     raise OSError("probe sem resposta real: %r" % r[:60])
             except (OSError, KeyError):
                 _tela_subir(cid)                  # primeira vez: sobe tudo
@@ -1904,8 +2620,8 @@ class Handler(BaseHTTPRequestHandler):
             # — tela preta no navegador; curl sempre falou 1.1, por isso os
             # testes passavam). Em 1.1 vem Transfer-Encoding: chunked e o
             # decodificador adiante repassa o multipart cru.
-            sock.sendall(b"GET /mjpeg HTTP/1.1\r\nHost: localhost:28090\r\n"
-                         b"Connection: close\r\n\r\n")
+            sock.sendall(("GET /mjpeg?%s HTTP/1.1\r\nHost: localhost:28090\r\n"
+                          "Connection: close\r\n\r\n" % perfil).encode())
             sock.settimeout(20)
             buf = b""
             while b"\r\n\r\n" not in buf:
@@ -1990,8 +2706,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _term_auth(self, qs):
         """Terminal: sessão do painel ou token de API (mesma régua de /painel/dados)."""
-        return self._sessao() or hmac.compare_digest((qs.get("token") or [""])[0],
-                                                     carregar()["token_painel"])
+        return self._sessao() or self._token_ok((qs.get("token") or [""])[0])
 
     def _stream_terminal(self, cid, sid, claude=False, sess=None, retomar=False):
         """Stream da saída do terminal. Shell: PTY atrelado a esta aba (morre
@@ -2093,6 +2808,50 @@ class Handler(BaseHTTPRequestHandler):
                 os.write(t["fd"], dados)
         self._json({"ok": True})
 
+    def _term_imagem(self, qs, corpo):
+        """Print/imagem enviada pelo técnico na página do terminal claude:
+        grava o arquivo em servidor/uploads/ e devolve o caminho — quem
+        injeta a mensagem no chat é a página. Prints são dado de cliente:
+        pasta fora do git e expurgo dos com mais de 30 dias no próprio
+        save (lista pequena, uma vez por upload não pesa)."""
+        cid = (qs.get("cid") or [""])[0]
+        if cid != OPERADOR_CID and cid not in carregar()["clientes"]:
+            self._erro(404, "cliente desconhecido")
+            return
+        b64 = corpo.get("b64") or ""
+        if len(b64) > 8 * 1024 * 1024:
+            self._erro(413, "imagem grande demais (máx 8 MB)")
+            return
+        try:
+            dados = base64.b64decode(b64)
+        except Exception:
+            self._erro(400, "base64 inválido")
+            return
+        # magia do formato: nada de confiar na extensão que o navegador mandou
+        magias = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpg"),
+                  (b"GIF8", "gif"), (b"RIFF", "webp"))
+        ext = next((e for m, e in magias if dados.startswith(m)), None)
+        if not ext:
+            self._erro(415, "arquivo não é PNG/JPG/GIF/WEBP")
+            return
+        pasta = os.path.join(BASE, "uploads")
+        os.makedirs(pasta, exist_ok=True)
+        arq = os.path.join(pasta, "print-%s-%s.%s" % (
+            time.strftime("%Y%m%d-%H%M%S"), secrets.token_hex(2), ext))
+        with open(arq, "wb") as f:
+            f.write(dados)
+        limite = time.time() - 30 * 86400
+        for velho in os.listdir(pasta):
+            p = os.path.join(pasta, velho)
+            try:
+                if os.stat(p).st_mtime < limite:
+                    os.unlink(p)
+            except OSError:
+                pass
+        print("print recebido: %s (%.0f KB, cid=%s)" % (
+            arq, len(dados) / 1024, cid), flush=True)
+        self._json({"ok": True, "arq": arq})
+
     def _term_tamanho(self, qs, corpo):
         t = TERMINAIS.get((qs.get("s") or [""])[0])
         if not t:
@@ -2126,6 +2885,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(dados)))
         self.end_headers()
         self.wfile.write(dados)
+
+    def _2fa_local(self):
+        """Pedido feito do próprio servidor (curl do operador/skills).
+
+        Cuidado: o cloudflared também conecta pelo loopback — mas ele sempre
+        traz CF-Connecting-IP/X-Forwarded-For preenchidos pela edge; pedido
+        local de verdade não traz nenhum dos dois.
+        """
+        if self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For"):
+            return False
+        return self.client_address[0] in ("127.0.0.1", "::1")
+
+    def _2fa_ativo(self):
+        """2FA exigido neste pedido: ativado E vindo de fora do servidor."""
+        d2 = carregar_2fa()
+        return bool(d2 and d2.get("ativo")) and not self._2fa_local()
+
+    def _token_ok(self, token):
+        """Token de API válido. Com 2FA ativo, de fora do servidor, o token
+        não basta (vira só o fator 1, que pede código na tela /painel)."""
+        return (hmac.compare_digest(token or "", carregar()["token_painel"])
+                and not self._2fa_ativo())
 
     def _sessao(self):
         """Cookie de sessão válido deste pedido, ou None."""

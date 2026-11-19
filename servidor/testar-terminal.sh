@@ -65,6 +65,35 @@ curl -fsS "$URL/painel/term?cid=$ID&token=$TOKEN" | grep -q "xterm.js" || falhar
 curl -fsS "$URL/xterm.js" -o "$WORK/x.js" || falhar "asset xterm.js"
 [ "$(stat -c%s "$WORK/x.js")" -gt 10000 ] || falhar "xterm.js veio truncado"
 
+# 4½) print de tela no chat do claude: rota /painel/term/imagem
+python3 - <<'PYEOF'
+import struct, zlib
+def chunk(t, d):
+    return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', 3, 2, 8, 2, 0, 0, 0)
+raw = b''.join(b'\x00' + b'\xff\x00\x7f' * 3 for _ in range(2))
+png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+       + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+open('/tmp/teste-print.png', 'wb').write(png)
+PYEOF
+B64=$(base64 -w0 /tmp/teste-print.png)
+R=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d "{\"b64\":\"$B64\"}" "$URL/painel/term/imagem?s=teste-img&cid=$ID&token=$TOKEN") \
+  || falhar "upload do print"
+ARQ=$(printf '%s' "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["arq"])')
+case "$ARQ" in *"/uploads/print-"*.png) : ;; *) falhar "caminho inesperado: $ARQ";; esac
+head -c8 "$ARQ" | od -An -tx1 | grep -q "89 50 4e 47" || falhar "arquivo salvo não é PNG"
+[ -f "/root/CODE/suporte-remoto/servidor/uploads/$(basename "$ARQ")" ] \
+  || falhar "print não caiu na pasta uploads/"
+# lixo (texto) e sem token têm que bater a porta
+CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -d '{"b64":"b2k="}' "$URL/painel/term/imagem?s=teste-img&cid=$ID&token=$TOKEN")
+[ "$CT" = "415" ] || falhar "não-imagem deveria dar 415 (veio $CT)"
+CS=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -d "{\"b64\":\"$B64\"}" "$URL/painel/term/imagem?s=teste-img&cid=$ID")
+[ "$CS" = "403" ] || falhar "sem token deveria dar 403 (veio $CS)"
+rm -f "$ARQ" /tmp/teste-print.png
+
 # 5) o terminal de verdade: stream do PTY + teclado via POST
 SID="teste-$(date +%s)"
 curl -N -s "$URL/painel/term/stream?cid=$ID&s=$SID&token=$TOKEN" > "$WORK/stream.out" &
