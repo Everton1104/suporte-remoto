@@ -21,3 +21,10 @@ servidor/extensoes/*.vsix
 
 # prints de tela recebidos no chat do painel (dado de cliente, fora do git)
 servidor/uploads/
+
+# mais segredos/estado do servidor (2FA, hosts conhecidos, WinPE)
+servidor/2fa.json
+servidor/known_hosts
+servidor/wpe-token.txt
+servidor/wpe-cmd.txt
+servidor/wpe-beacons.log
