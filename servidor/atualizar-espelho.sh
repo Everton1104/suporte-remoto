@@ -129,5 +129,24 @@ print("versoes.json:", versoes)
 PY
 
 echo
+echo "== claude CLI deste Termux (o cérebro do operador) =="
+# junto do espelho por pedido do Everton (24/11): uma rotina só atualiza
+# tudo do servidor. `claude update` resolve a instalação (npm global aqui);
+# timeout 5min aguenta rede lenta sem pendurar a rotina; falha não derruba
+# o resto — sessões abertas seguem na versão em memória, a nova vale pra
+# próximas.
+if command -v claude >/dev/null 2>&1; then
+    echo "  antes: $(claude --version 2>/dev/null | head -1)"
+    if timeout 300 claude update; then
+        echo "  depois: $(claude --version 2>/dev/null | head -1)"
+    else
+        echo "  claude update falhou (rc=$?) — atualize à mão" >&2
+    fi
+else
+    echo "  claude não está no PATH" >&2
+fi
+
+echo
 echo "Espelho atualizado. Rodando pelo painel (botão 'atualizar agora') o aviso"
 echo "sai sozinho; pelo terminal, clique em 'procurar atualização' para limpar."
+echo "Publicar no servidor ativo: bash servidor/sincronizar-espelho.sh"

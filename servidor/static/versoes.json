@@ -1,5 +1,5 @@
 {
- "cloudflared": "2026.11.1",
+ "cloudflared": "2026.11.2",
  "openssh": "10.4.0.0p1-Preview",
  "curl": "8.23.0_6",
  "deb-trixie": "11.1.0-5+deb13u4",
