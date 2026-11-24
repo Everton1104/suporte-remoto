@@ -50,13 +50,11 @@ Roda em 127.0.0.1:8090, publicado no Cloudflare Tunnel como
 suporte.evertonrs.com.br.
 """
 import base64
-import fcntl
 import hashlib
 import hmac
 import io
 import json
 import os
-import pty
 import queue
 import re
 import secrets
@@ -66,11 +64,19 @@ import socket
 import sys
 import struct
 import subprocess
-import termios
 import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta
+
+# multi-SO: o servidor roda em Linux (celular/proot) ou Windows (PC do Will).
+# fcntl/pty/termios são Unix-only (terminal PTY); no Windows a v1 sobe sem
+# terminal web — painel, poll, ações, túneis e mesa funcionam igual.
+IS_WIN = os.name == "nt"
+if not IS_WIN:
+    import fcntl
+    import pty
+    import termios
 from html import escape as html_escape
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,7 +86,8 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 PORTA = 8090
 REGISTRO = os.path.join(BASE, "clientes.json")
 DIR_CLIENTES = os.path.join(BASE, "clientes")
-AK_TUNEL = "/home/suporte/.ssh/authorized_keys"
+AK_TUNEL = (r"C:\ProgramData\ssh\administrators_authorized_keys" if IS_WIN
+            else "/home/suporte/.ssh/authorized_keys")
 PORTA_BASE = 10023      # 10022 fica para o fluxo de sessão única
 LIMITE_CLIENTES = 50
 URL_BASE = os.environ.get("URL_BASE", "https://suporte.evertonrs.com.br")
@@ -102,6 +109,9 @@ _CLAUDE_CRIAR_LOCK = threading.Lock()
 # abre/fecha conexões a pedido, cria watchers, avisa o painel. Chave sintética
 # em CLAUDE_SESSOES: slug de cliente real é só [a-z0-9-], underscore não colide.
 OPERADOR_CID = "__operador__"
+TERMUX_CID = "__termux__"       # shell do Termux (cérebro do operador) no Win
+TERMUX_IP = "192.168.0.99"      # celular na LAN (wlan0) — o servidor Windows
+                                # que estiver por perto conecta aqui por ele
 OPERADOR_CTX = (
     "Modo OPERADOR do suporte-remoto: voce administra ESTE servidor de suporte "
     "(painel, clientes, conexoes) — nao uma maquina cliente especifica. O tecnico "
@@ -563,6 +573,17 @@ def _rabo_atualizar():
 
 def _atualizar_espelho():
     """Roda atualizar-espelho.sh pelo botão do painel; log vai para o banner."""
+    if IS_WIN:
+        with open(ARQ_ATUALIZAR_LOG, "w") as log:
+            log.write("o espelho mora no Termux (servidor Linux): "
+                      "atualizar-espelho.sh roda lá e sincronizar-espelho.sh "
+                      "publica aqui. Peça ao claude (servidor) do painel.\n")
+        ATUALIZAR["ok"] = False
+        # sem isto o banner "atualizando…" ficava eterno no Windows: o return
+        # pulava o fim/rodando=False do caminho Linux (bug de 23/11)
+        ATUALIZAR["fim"] = time.time()
+        ATUALIZAR["rodando"] = False
+        return
     with open(ARQ_ATUALIZAR_LOG, "w") as log:
         try:
             # grupo próprio de processos: no timeout o killPG mata o curl
@@ -669,6 +690,11 @@ def abrir_terminal(cid, claude=False, sess=None, retomar=False):
     abertura fixa o id da conversa (--session-id) e o reload retoma
     (--resume) — a conversa sobrevive ao F5 porque o CLI persiste o
     histórico em disco."""
+    if IS_WIN:
+        # v2 (24/11): tudo vira ssh.exe — shell do cliente no túnel reverso,
+        # PowerShell do próprio Will e o shell/claude DO TERMUX pela LAN
+        # (o cérebro do operador continua no celular; ver _abrir_terminal_win)
+        return _abrir_terminal_win(cid, claude, sess, retomar)
     reg = carregar()
     if cid != OPERADOR_CID and cid not in reg["clientes"]:
         raise KeyError("cliente desconhecido: %s" % cid)
@@ -727,7 +753,128 @@ def abrir_terminal(cid, claude=False, sess=None, retomar=False):
     return pid, fd
 
 
+SSH_EXE = r"C:\Windows\System32\OpenSSH\ssh.exe"
+
+
+class _SshPipeWin:
+    """Shell do terminal v2 no servidor Windows: ssh.exe com pipes crus.
+
+    O ConPTY local (conpty.py, ctypes) foi caçado um dia inteiro no 24H2 do
+    Will: o filho nasce, o conhost do pseudoconsole emite títulos/escapes
+    pelo pipe, mas o TEXTO do app desvia pro console do pai (ou pro void,
+    no serviço SYSTEM) — regressão do 24H2 sem resposta da MS (thread
+    "Windows 11 24H2 and problem CreatePseudoConsole"). Solução: NÃO criar
+    pty local — o sshd do destino cria o pty dele (o sshd Windows dos
+    clientes já faz isso há meses). Vale pro túnel do cliente E pro próprio
+    servidor (ssh som@localhost): echo, prompt e UTF-8 vêm do lado remoto.
+    """
+    def __init__(self, argv):
+        self._p = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, cwd=BASE)
+        self.pid = self._p.pid
+        self._fila = queue.Queue()
+        threading.Thread(target=self._leitor, daemon=True).start()
+
+    def _leitor(self):
+        while True:
+            # read1: read(65536) esperaria encher 64 KB/EOF e o banner
+            # ficava preso no buffer (bug do dia — 15s de silêncio absoluto)
+            dados = self._p.stdout.read1(65536)
+            if not dados:
+                break
+            self._fila.put(dados)
+        self._fila.put(None)          # EOF: processo saiu
+
+    def read(self, timeout):
+        """bytes | b"" (nada no timeout) | None (processo saiu)."""
+        try:
+            return self._fila.get(timeout=timeout)
+        except queue.Empty:
+            return b""
+
+    def write(self, dados):
+        self._p.stdin.write(dados)
+        self._p.stdin.flush()
+
+    def resize(self, cols, rows):
+        pass                          # sem pty local: tamanho é do remoto
+
+    @property
+    def alive(self):
+        return self._p.poll() is None
+
+    def terminate(self):
+        # kill() só no ssh.exe; o shell remoto cai junto com a conexão
+        try:
+            self._p.kill()
+        except OSError:
+            pass
+
+
+def _abrir_terminal_win(cid, claude=False, sess=None, retomar=False):
+    """Terminal v2 no servidor Windows: ssh.exe -tt com pipes (ver
+    _SshPipeWin). Devolve (pid, _SshPipeWin) — o "fd" do dict do terminal
+    vira o objeto. Shell da máquina onde o servidor web roda não existe
+    aqui: se ela for um cliente instalado (como o Will), o terminal do
+    card da lista resolve — nada de caminho especial."""
+    if cid in (TERMUX_CID, OPERADOR_CID):
+        # o CÉREBRO continua no Termux: claude com as skills operar/atender,
+        # shell do servidor. Direto pela LAN (o ssh.exe através de listener
+        # -R do sshd Windows quebra no banner exchange — bug aberto, v2)
+        pasta = os.path.join(BASE, "clientes-termux")
+        argv = [SSH_EXE, "-tt", "-p", "2222",
+                "-i", os.path.join(pasta, "chave-operador"),
+                "-o", "UserKnownHostsFile=" + os.path.join(pasta, "known_hosts"),
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+                "-o", "ConnectTimeout=12",
+                "root@" + TERMUX_IP]
+        if claude:
+            # sess vem da URL: mesma validação do caminho Unix antes de
+            # virar linha de comando remota
+            if not (sess and all(ch in "0123456789abcdefABCDEF-" for ch in sess)):
+                sess = None
+            ctx = OPERADOR_CTX.replace("'", "").replace('"', "")
+            cmd = ("stty rows 40 cols 150 2>/dev/null;"
+                   " export TERM=xterm-256color; cd /root/CODE/suporte-remoto"
+                   " && claude")
+            if sess and retomar:
+                # F5: --resume se a conversa já gravou — a checagem do
+                # arquivo tem que ser no disco DO TermUX, então o próprio
+                # shell remoto decide (resume falha → session-id)
+                cmd += (" --resume %s 2>/dev/null || claude --session-id %s"
+                        ' --append-system-prompt "%s"' % (sess, sess, ctx))
+            elif sess:
+                cmd += ' --session-id %s --append-system-prompt "%s"' % (sess, ctx)
+            else:
+                cmd += ' --append-system-prompt "%s"' % ctx
+            argv.append(cmd)
+        else:
+            argv.append("stty rows 40 cols 150 2>/dev/null; exec bash -l")
+    else:
+        reg = carregar()
+        if cid not in reg["clientes"]:
+            raise KeyError("cliente desconhecido: %s" % cid)
+        c = reg["clientes"][cid]
+        pasta = os.path.join(DIR_CLIENTES, cid)
+        argv = [SSH_EXE, "-tt", "-p", str(c["porta"]),
+                "-i", os.path.join(pasta, "chave-tecnico"),
+                "-o", "UserKnownHostsFile=" + os.path.join(pasta, "known_hosts"),
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+                (c.get("usuario") or "suporte") + "@localhost"]
+    p = _SshPipeWin(argv)
+    return p.pid, p
+
+
 def _matar_terminal(t):
+    if IS_WIN:
+        try:
+            t["fd"].terminate()      # ConPty: ClosePseudoConsole + kill
+        except OSError:
+            pass
+        return
     try:
         os.close(t["fd"])
     except OSError:
@@ -742,12 +889,20 @@ def _claude_reader(cid, t):
     """Único dono do fd da sessão claude: lê o PTY, alimenta o scrollback e
     replica a cada inscrito. Processo sair -> EOF (None) a todos e limpeza."""
     while True:
-        try:
-            dados = os.read(t["fd"], 65536)
-        except OSError:
-            dados = b""
-        if not dados:
-            break
+        if IS_WIN:
+            # _SshPipeWin: fila do leitor; b"" é timeout (continua), None é fim
+            dados = t["fd"].read(2)
+            if dados is None:
+                break
+            if not dados:
+                continue
+        else:
+            try:
+                dados = os.read(t["fd"], 65536)
+            except OSError:
+                dados = b""
+            if not dados:
+                break
         with t["lock"]:
             t["buffer"] += dados
             if len(t["buffer"]) > CLAUDE_BUF_MAX:
@@ -762,10 +917,11 @@ def _claude_reader(cid, t):
     time.sleep(1)          # dá tempo das streams drenarem o EOF
     if CLAUDE_SESSOES.get(cid) is t:
         CLAUDE_SESSOES.pop(cid, None)
-    try:
-        os.close(t["fd"])
-    except OSError:
-        pass
+    if not IS_WIN:
+        try:
+            os.close(t["fd"])
+        except OSError:
+            pass
     print("sessão claude saiu (cid=%s)" % cid, flush=True)
 
 
@@ -846,6 +1002,8 @@ def _sub_tela(argv, timeout):
 
 def _tela_subir(cid):
     """Sobe o tela.ps1 no cliente + o ssh -L (tela.sh subir)."""
+    if IS_WIN:
+        raise RuntimeError("tela remota ainda não portada pro servidor Windows (v2)")
     t0 = time.time()
     try:
         r = _sub_tela([os.path.join(BASE, "tela.sh"), cid, "subir"], 90)
@@ -1236,6 +1394,8 @@ PAGINA_PAINEL = """<!doctype html><meta charset=utf-8>
  <button class=term onclick=verificar()>procurar atualização</button>
  <button class=opb title="claude operando O SERVIDOR: abre/fecha conexões, cria watchers… peça por lá"
   onclick="location.href='/painel/term?cid=__operador__&amp;claude=1'">claude (servidor)</button>
+ <button class=opb title="shell do Termux no celular — o servidor Linux onde mora o claude (LAN)"
+  onclick="location.href='/painel/term?cid=__termux__'">terminal (servidor)</button>
  <span id=vermsg class=vermsg></span>
 </div>
 <table id=t><thead><tr>
@@ -1431,7 +1591,7 @@ PAGINA_TERMINAL = """<!doctype html><meta charset=utf-8>
       border-radius:6px;font-size:15px}
  #enviarmsg{background:#2c8;border:0;border-radius:6px;padding:10px 16px;color:#041;
             font-weight:600;cursor:pointer}
- #escbtn,#imgbtn{background:#333;color:#ccc;border:0;border-radius:6px;
+ #escbtn,#tabbtn,#enterbtn,#imgbtn{background:#333;color:#ccc;border:0;border-radius:6px;
          padding:10px 12px;cursor:pointer}
  #imgbtn{font-size:15px;line-height:1;padding:10px 12px}
  #imgbtn:disabled{opacity:.4;cursor:wait}
@@ -1462,6 +1622,8 @@ PAGINA_TERMINAL = """<!doctype html><meta charset=utf-8>
 <div id=sb><button id=sbUp>▲</button><div id=sbTrack><div id=sbThumb></div></div>
  <button id=sbDn>▼</button></div>
 <div id=chatbar><button id=escbtn title="tecla Esc — interrompe o claude">esc</button>
+ <button id=tabbtn title="tecla Tab — autocomplete do claude / navegação">tab</button>
+ <button id=enterbtn title="tecla Enter direto no terminal — confirma prompt sem enviar mensagem">enter</button>
  <button id=imgbtn title="mandar print/imagem pro claude — ou cole com Ctrl+V, ou arraste a imagem aqui">📷</button>
  <input id=msg placeholder="mensagem para o claude — Enter envia" autocomplete=off>
  <button id=enviarmsg>enviar</button>
@@ -1616,6 +1778,8 @@ document.getElementById('msg').addEventListener('keydown',e=>{
   if(e.key==='Enter'){e.preventDefault();enviarMsg();}
 });
 document.getElementById('escbtn').addEventListener('click',()=>{fila.push('\\x1b');bombear();});
+document.getElementById('tabbtn').addEventListener('click',()=>{fila.push('\\t');bombear();});
+document.getElementById('enterbtn').addEventListener('click',()=>{fila.push('\\r');bombear();});
 // prints de tela pro claude: 📷 / Ctrl+V / arrastar → upload → a mensagem
 // cita o caminho salvo no servidor; o claude abre o arquivo com a
 // ferramenta Read e passa a "ver" a imagem. Reduz a no máx 1800px no
@@ -2291,6 +2455,14 @@ class Handler(BaseHTTPRequestHandler):
                     self._erro(404, "operador é modo claude apenas (?claude=1)")
                     return
                 win = False
+            elif cid == TERMUX_CID:
+                # shell do Termux (o cérebro): só no servidor Windows
+                if claude or not IS_WIN:
+                    self._erro(404, "terminal do termux: só no servidor "
+                                   "Windows, sem claude (claude é o botão "
+                                   "claude (servidor))")
+                    return
+                win = False   # UTF-8 nativo do Linux remoto
             else:
                 reg = carregar()
                 if cid not in reg["clientes"]:
@@ -2759,23 +2931,52 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(item)
                     self.wfile.flush()
             else:
+                calmo = 0
                 while True:
-                    r, _, _ = select.select([t["fd"]], [], [], 15)
-                    if not r:
-                        self.wfile.write(b"\x1b[?25l\x1b[?25h")
-                        self.wfile.flush()
-                        continue
-                    try:
-                        dados = os.read(t["fd"], 65536)
-                    except OSError:
-                        break
-                    if not dados:
-                        break
+                    if IS_WIN:
+                        # ConPty: a thread leitora do conpty.py empurra numa
+                        # fila. Fim detectado por alive — o conhost segura o
+                        # pipe até o ClosePseudoConsole, então o EOF (None)
+                        # nunca chega sozinho quando o filho sai
+                        dados = t["fd"].read(2)
+                        if dados is None:
+                            break
+                        if not dados:
+                            if not t["fd"].alive:
+                                for _ in range(80):    # drena o último output
+                                    resto = t["fd"].read(0.1)
+                                    if not resto or resto is None:
+                                        break
+                                    self.wfile.write(resto)
+                                    self.wfile.flush()
+                                break
+                            calmo += 2
+                            if calmo < 15:
+                                continue
+                            calmo = 0
+                            self.wfile.write(b"\x1b[?25l\x1b[?25h")
+                            self.wfile.flush()
+                            continue
+                        else:
+                            calmo = 0
+                    else:
+                        r, _, _ = select.select([t["fd"]], [], [], 15)
+                        if not r:
+                            self.wfile.write(b"\x1b[?25l\x1b[?25h")
+                            self.wfile.flush()
+                            continue
+                        try:
+                            dados = os.read(t["fd"], 65536)
+                        except OSError:
+                            break
+                        if not dados:
+                            break
                     t["ultima"] = time.time()
                     self.wfile.write(dados)
                     self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass                                   # navegador fechou a aba
+        except OSError:
+            pass   # navegador fechou a aba (BrokenPipe/Reset/Aborted — no
+            # Windows o curl aborta com ConnectionAbortedError, fora das duas)
         finally:
             if claude:
                 with t["lock"]:
@@ -2805,7 +3006,10 @@ class Handler(BaseHTTPRequestHandler):
             # gravação serializada: threads concorrentes escrevendo juntas
             # embaralhavam a digitação no PTY
             with t["lock"]:
-                os.write(t["fd"], dados)
+                if IS_WIN:
+                    t["fd"].write(dados)
+                else:
+                    os.write(t["fd"], dados)
         self._json({"ok": True})
 
     def _term_imagem(self, qs, corpo):
@@ -2861,7 +3065,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         cols = max(2, min(400, int(corpo.get("cols") or 80)))
         rows = max(2, min(200, int(corpo.get("rows") or 24)))
-        fcntl.ioctl(t["fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        if IS_WIN:
+            t["fd"].resize(cols, rows)
+        else:
+            fcntl.ioctl(t["fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self._json({"ok": True})
 
     def _term_fechar(self, qs):
@@ -2973,11 +3180,13 @@ if __name__ == "__main__":
     # terminais são pty.fork: sem ninguém pra waitpid, cada terminal fechado
     # virava zombie até o serviço reiniciar. SIG_IGN no SIGCHLD = kernel
     # ceifa sozinho (web.py nunca espera filhos, então é a forma certa)
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    if not IS_WIN:
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     reg = carregar()
     _carregar_sessoes()
     threading.Thread(target=_janitor_terminais, daemon=True).start()
     threading.Thread(target=_thread_atualizacoes, daemon=True).start()
     print("suporte-remoto web em 127.0.0.1:%d" % PORTA, flush=True)
     print("painel: /painel (senha em clientes.json; espelho: %s)" % _ler_versoes(), flush=True)
-    ThreadingHTTPServer(("127.0.0.1", PORTA), Handler).serve_forever()
+    # 0.0.0.0: acesso direto na LAN (http://192.168.0.99:8090) além do túnel CF
+    ThreadingHTTPServer(("0.0.0.0", PORTA), Handler).serve_forever()
