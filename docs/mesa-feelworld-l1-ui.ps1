@@ -117,11 +117,20 @@ function SelectTake([int]$cam) {
 function Trocar([int]$cam) {
   if (-not $script:sessao) { AbreSessao | Out-Null }
   $a = SelectTake $cam
-  Start-Sleep -Milliseconds 1500
-  $b = SelectTake $cam
+  # v6: TAKE duplicado REVERTE a troca na L1 (testado 23/11: select+take 2x
+  # com preview==programa faz voltar pra camera anterior ~1s depois). So
+  # reenvia quando a 1a rodada veio ruim (ACK ffffffff/vazio) — SelectTake
+  # ja refaz internamente; este reenvio cobre o caso raro de resposta boa
+  # com execucao falha, SEM o efeito revert do take repetido.
+  if (Ruim $a) {
+    Start-Sleep -Milliseconds 1500
+    $b = SelectTake $cam
+    Log "camera $cam (1=$a 2=$b REENVIADA)"
+  } else {
+    Log "camera $cam ($a)"
+  }
   $script:atual = $cam
   Agendar
-  Log "camera $cam (1=$a 2=$b)"
 }
 function Agendar {
   $c = $script:cfg.cams | Where-Object { $_.n -eq $script:atual }

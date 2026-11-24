@@ -20,7 +20,9 @@ Regra de ouro: **nunca enviar o poll F1 40 01 (status 22) — envenena a L1**.
 `https://cam.evertonrs.com.br` → cloudflared (ingress no
 `/root/.cloudflared/config.yml`) → `ssh -L 127.0.0.1:8123:...` (porta 10027,
 túnel reverso do cliente) → UI no Will. Watchdog que religa o ssh:
-`servidor/watch-cam.sh`. Hosts do WTG tem linha `# mesa-cam` apontando o
+`servidor/watch-cam.sh`, rodando como **serviço runit `watch-cam` no Termux**
+(`var/service/watch-cam/run`, log `/var/log/svc/watch-cam.log`) — sobrevive a
+reboot do servidor (22/11). Hosts do WTG tem linha `# mesa-cam` apontando o
 domínio pra edge da Cloudflare (remover quando o DNS propagar).
 
 ## Desmontagem total (fim da maratona)
