@@ -83,7 +83,7 @@ R=$(curl -fsS -X POST -H 'Content-Type: application/json' \
 ARQ=$(printf '%s' "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["arq"])')
 case "$ARQ" in *"/uploads/print-"*.png) : ;; *) falhar "caminho inesperado: $ARQ";; esac
 head -c8 "$ARQ" | od -An -tx1 | grep -q "89 50 4e 47" || falhar "arquivo salvo não é PNG"
-[ -f "/root/CODE/suporte-remoto/servidor/uploads/$(basename "$ARQ")" ] \
+[ -f "$BASE/uploads/$(basename "$ARQ")" ] \
   || falhar "print não caiu na pasta uploads/"
 # lixo (texto) e sem token têm que bater a porta
 CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
@@ -94,9 +94,11 @@ CS=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: applicatio
 [ "$CS" = "403" ] || falhar "sem token deveria dar 403 (veio $CS)"
 rm -f "$ARQ" /tmp/teste-print.png
 
-# 5) o terminal de verdade: stream do PTY + teclado via POST
+# 5) o terminal de verdade: stream do PTY + teclado via POST. cols/rows na
+# query = o fit() da aba: o PTY tem que NAScer nesse tamanho (o stty size
+# dentro da sessão confirma — sem isso nascia no chute 24x80)
 SID="teste-$(date +%s)"
-curl -N -s "$URL/painel/term/stream?cid=$ID&s=$SID&token=$TOKEN" > "$WORK/stream.out" &
+curl -N -s "$URL/painel/term/stream?cid=$ID&s=$SID&cols=137&rows=29&token=$TOKEN" > "$WORK/stream.out" &
 SPID=$!
 sleep 6   # pré-voo do atender.sh + login ssh
 grep -q "shell elevado" "$WORK/stream.out" || falhar "stream não mostrou o pré-voo do atender"
@@ -104,6 +106,10 @@ curl -fsS -X POST --data-binary 'echo TERMINAL_OK_$$' "$URL/painel/term/in?s=$SI
 curl -fsS -X POST --data-binary $'\r' "$URL/painel/term/in?s=$SID&token=$TOKEN" >/dev/null
 sleep 3
 grep -q "TERMINAL_OK_" "$WORK/stream.out" || falhar "comando do terminal não voltou no stream"
+curl -fsS -X POST --data-binary 'stty size' "$URL/painel/term/in?s=$SID&token=$TOKEN" >/dev/null
+curl -fsS -X POST --data-binary $'\r' "$URL/painel/term/in?s=$SID&token=$TOKEN" >/dev/null
+sleep 2
+grep -q "29 137" "$WORK/stream.out" || falhar "PTY não nasceu no tamanho da query (esperado 29 137)"
 curl -fsS -X POST -H 'Content-Type: application/json' -d '{"cols":120,"rows":40}' \
     "$URL/painel/term/size?s=$SID&token=$TOKEN" >/dev/null || falhar "resize"
 curl -fsS -X POST "$URL/painel/term/fechar?s=$SID&token=$TOKEN" >/dev/null || falhar "fechar"

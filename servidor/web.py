@@ -112,6 +112,7 @@ OPERADOR_CID = "__operador__"
 TERMUX_CID = "__termux__"       # shell do Termux (cérebro do operador) no Win
 TERMUX_IP = "192.168.0.99"      # celular na LAN (wlan0) — o servidor Windows
                                 # que estiver por perto conecta aqui por ele
+TERMUX_BASE = "/root/CODE/suporte-remoto"   # raiz do projeto NO Termux (resize)
 OPERADOR_CTX = (
     "Modo OPERADOR do suporte-remoto: voce administra ESTE servidor de suporte "
     "(painel, clientes, conexoes) — nao uma maquina cliente especifica. O tecnico "
@@ -681,7 +682,16 @@ def _ler_avisos():
 
 # ---------------- terminal web (xterm) ----------------
 
-def abrir_terminal(cid, claude=False, sess=None, retomar=False):
+def _qint(v, lo, hi):
+    """Inteiro da querystring, clampado; 0 se veio lixo/ausente."""
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def abrir_terminal(cid, claude=False, sess=None, retomar=False, cols=0, rows=0,
+                   sid=None):
     """Abre um PTY: atender.sh <cid> (shell do cliente no navegador) ou, em
     modo claude, o Claude Code do próprio servidor — que alcança o cliente
     pelo túnel reverso via skill /atender, como se morasse na máquina dele.
@@ -689,12 +699,16 @@ def abrir_terminal(cid, claude=False, sess=None, retomar=False):
     (skill 'operar'). Com sess (uuid do sessionStorage da página): primeira
     abertura fixa o id da conversa (--session-id) e o reload retoma
     (--resume) — a conversa sobrevive ao F5 porque o CLI persiste o
-    histórico em disco."""
+    histórico em disco. cols/rows é o tamanho JÁ medido pelo fit() do xterm
+    na aba que pediu (a página manda na query do /stream): sem isso o PTY
+    nascia num chute (24x80 Unix, 40x150 Windows) e o app remoto desenhava
+    noutra geometria que a tela — terminal "não ficava tela cheia". sid é o
+    identificador s da aba (nomeia o arquivo de resize do shell v2)."""
     if IS_WIN:
         # v2 (24/11): tudo vira ssh.exe — shell do cliente no túnel reverso,
         # PowerShell do próprio Will e o shell/claude DO TERMUX pela LAN
         # (o cérebro do operador continua no celular; ver _abrir_terminal_win)
-        return _abrir_terminal_win(cid, claude, sess, retomar)
+        return _abrir_terminal_win(cid, claude, sess, retomar, cols, rows, sid)
     reg = carregar()
     if cid != OPERADOR_CID and cid not in reg["clientes"]:
         raise KeyError("cliente desconhecido: %s" % cid)
@@ -749,7 +763,10 @@ def abrir_terminal(cid, claude=False, sess=None, retomar=False):
         except BaseException:
             pass
         os._exit(127)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    # tamanho do fit() da aba (o POST /size continua existindo pra mudanças
+    # posteriores — girar celular, redimensionar janela)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ,
+                struct.pack("HHHH", rows or 24, cols or 80, 0, 0))
     return pid, fd
 
 
@@ -767,14 +784,55 @@ class _SshPipeWin:
     pty local — o sshd do destino cria o pty dele (o sshd Windows dos
     clientes já faz isso há meses). Vale pro túnel do cliente E pro próprio
     servidor (ssh som@localhost): echo, prompt e UTF-8 vêm do lado remoto.
+
+    Resize: sem pty local o ssh.exe nunca manda window-change, então o pty
+    REMOTO fica no tamanho do stty inicial pra sempre (o claude continuava
+    desenhando em 40x150 com a aba maior — "terminal não fica tela cheia").
+    Quando o destino é o Termux, o comando inicial grava o tty da sessão em
+    servidor/sessoes/tty-<id> e o resize() acorda uma worker que, por um
+    ssh rápido paralelo, aplica stty -F <tty> rows/cols LÁ — ioctl no pty
+    certo + SIGWINCH pro app (provado no Termux: o claude re-renderiza).
+    Cliente Windows não tem equivalente (console pertence à sessão): fica
+    no tamanho da abertura.
     """
-    def __init__(self, argv):
+    def __init__(self, argv, rz_base=None, tty_id=None):
         self._p = subprocess.Popen(argv, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, cwd=BASE)
         self.pid = self._p.pid
         self._fila = queue.Queue()
         threading.Thread(target=self._leitor, daemon=True).start()
+        self._rz_cmd = None
+        if rz_base and tty_id:
+            self._rz_base = rz_base + ["root@" + TERMUX_IP]
+            self._rz_cmd = ("stty -F $(cat %s/servidor/sessoes/tty-%s 2>/dev/null)"
+                            " rows %%d cols %%d 2>/dev/null"
+                            % (TERMUX_BASE, tty_id))
+            self._rz_lk = threading.Lock()
+            self._rz_alvo = None
+            self._rz_ev = threading.Event()
+            threading.Thread(target=self._rz_worker, daemon=True).start()
+
+    def _rz_worker(self):
+        """Aplica o ÚLTIMO tamanho pedido (drag/rotação geram dezenas de
+        POSTs — coalesce: espera a poeira baixar e manda um ssh só)."""
+        while True:
+            self._rz_ev.wait()
+            self._rz_ev.clear()
+            time.sleep(0.5)
+            with self._rz_lk:
+                alvo, self._rz_alvo = self._rz_alvo, None
+            if self._p.poll() is not None:
+                return               # sessão morreu: worker vai embora junto
+            if not alvo:
+                continue
+            try:
+                subprocess.run(self._rz_base + [self._rz_cmd % alvo],
+                               stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=12)
+            except (OSError, subprocess.SubprocessError):
+                pass                 # best-effort: próximo resize tenta de novo
 
     def _leitor(self):
         while True:
@@ -798,7 +856,12 @@ class _SshPipeWin:
         self._p.stdin.flush()
 
     def resize(self, cols, rows):
-        pass                          # sem pty local: tamanho é do remoto
+        if self._rz_cmd:
+            with self._rz_lk:
+                # tupla na ordem do _rz_cmd (rows primeiro!) — o teste de
+                # campo pegou o PTY em 170 linhas x 44 colunas invertido
+                self._rz_alvo = (int(rows), int(cols))
+            self._rz_ev.set()
 
     @property
     def alive(self):
@@ -812,32 +875,47 @@ class _SshPipeWin:
             pass
 
 
-def _abrir_terminal_win(cid, claude=False, sess=None, retomar=False):
+def _abrir_terminal_win(cid, claude=False, sess=None, retomar=False, cols=0, rows=0,
+                        sid=None):
     """Terminal v2 no servidor Windows: ssh.exe -tt com pipes (ver
     _SshPipeWin). Devolve (pid, _SshPipeWin) — o "fd" do dict do terminal
-    vira o objeto. Shell da máquina onde o servidor web roda não existe
-    aqui: se ela for um cliente instalado (como o Will), o terminal do
-    card da lista resolve — nada de caminho especial."""
+    vira o objeto. cols/rows é o fit() da aba (0 = não veio: fallback do
+    chute antigo 40x150 pro Termux / default do sshd pro cliente). Shell da
+    máquina onde o servidor web roda não existe aqui: se ela for um cliente
+    instalado (como o Will), o terminal do card da lista resolve — nada de
+    caminho especial."""
+    cols = _qint(cols, 2, 400) or 150
+    rows = _qint(rows, 2, 200) or 40
+    rz_base = tty_id = None
     if cid in (TERMUX_CID, OPERADOR_CID):
         # o CÉREBRO continua no Termux: claude com as skills operar/atender,
         # shell do servidor. Direto pela LAN (o ssh.exe através de listener
         # -R do sshd Windows quebra no banner exchange — bug aberto, v2)
         pasta = os.path.join(BASE, "clientes-termux")
-        argv = [SSH_EXE, "-tt", "-p", "2222",
+        base = ["-p", "2222",
                 "-i", os.path.join(pasta, "chave-operador"),
                 "-o", "UserKnownHostsFile=" + os.path.join(pasta, "known_hosts"),
                 "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "BatchMode=yes",
                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
-                "-o", "ConnectTimeout=12",
-                "root@" + TERMUX_IP]
+                "-o", "ConnectTimeout=12"]
+        argv = [SSH_EXE, "-tt"] + base + ["root@" + TERMUX_IP]
+        # resize vivo (ver _SshPipeWin): comando grava o tty da sessão; o
+        # arquivo é nomeado por conversa (claude) ou por aba (shell) e os
+        # velhos (>12h) são varridos na abertura seguinte
+        tty_id = ("claude-" + cid) if claude else ("sh-" + (sid or "0"))
+        rz_base = [SSH_EXE, "-o", "ConnectTimeout=6"] + base
+        pre = ("stty rows %d cols %d 2>/dev/null; tty >%s/servidor/sessoes/tty-%s"
+               " 2>/dev/null; find %s/servidor/sessoes -name 'tty-*' -mmin +720"
+               " -delete 2>/dev/null; " % (rows, cols, TERMUX_BASE, tty_id,
+                                           TERMUX_BASE))
         if claude:
             # sess vem da URL: mesma validação do caminho Unix antes de
             # virar linha de comando remota
             if not (sess and all(ch in "0123456789abcdefABCDEF-" for ch in sess)):
                 sess = None
             ctx = OPERADOR_CTX.replace("'", "").replace('"', "")
-            cmd = ("stty rows 40 cols 150 2>/dev/null;"
-                   " export TERM=xterm-256color; cd /root/CODE/suporte-remoto"
+            cmd = (pre + "export TERM=xterm-256color; cd /root/CODE/suporte-remoto"
                    " && claude")
             if sess and retomar:
                 # F5: --resume se a conversa já gravou — a checagem do
@@ -851,7 +929,7 @@ def _abrir_terminal_win(cid, claude=False, sess=None, retomar=False):
                 cmd += ' --append-system-prompt "%s"' % ctx
             argv.append(cmd)
         else:
-            argv.append("stty rows 40 cols 150 2>/dev/null; exec bash -l")
+            argv.append(pre + "exec bash -l")
     else:
         reg = carregar()
         if cid not in reg["clientes"]:
@@ -864,7 +942,7 @@ def _abrir_terminal_win(cid, claude=False, sess=None, retomar=False):
                 "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
                 (c.get("usuario") or "suporte") + "@localhost"]
-    p = _SshPipeWin(argv)
+    p = _SshPipeWin(argv, rz_base, tty_id)
     return p.pid, p
 
 
@@ -925,9 +1003,11 @@ def _claude_reader(cid, t):
     print("sessão claude saiu (cid=%s)" % cid, flush=True)
 
 
-def _claude_pegar(cid, sess=None, retomar=False):
+def _claude_pegar(cid, sess=None, retomar=False, cols=0, rows=0):
     """Sessão claude viva do cliente — cria se não houver. Um processo por
-    cliente: segunda aba anexa na mesma, não nasce outra."""
+    cliente: segunda aba anexa na mesma, não nasce outra. cols/rows só
+    importam na CRIAÇÃO (tamanho do fit da 1ª aba); reanexo/resize vem pelo
+    POST /size."""
     t = CLAUDE_SESSOES.get(cid)
     if t:
         return t, False
@@ -937,7 +1017,7 @@ def _claude_pegar(cid, sess=None, retomar=False):
         t = CLAUDE_SESSOES.get(cid)   # outra thread pode ter criado no meio
         if t:
             return t, False
-        pid, fd = abrir_terminal(cid, True, sess, retomar)
+        pid, fd = abrir_terminal(cid, True, sess, retomar, cols, rows)
         t = {"pid": pid, "fd": fd, "cid": cid, "claude": True, "csess": sess,
              "buffer": bytearray(), "subs": set(), "lock": threading.Lock(),
              "ultima": time.time()}
@@ -1978,6 +2058,7 @@ addEventListener('pagehide',()=>{
     const ctl=new AbortController();
     const relogio=setTimeout(()=>ctl.abort(),15000);
     r=await fetch('/painel/term/stream?cid='+encodeURIComponent(cid)+'&s='+s
+      +'&cols='+term.cols+'&rows='+term.rows
       +(modoClaude?'&claude=1&sess='+csess+(retomar?'&retomar=1':''):''),{signal:ctl.signal});
     clearTimeout(relogio);
     // anexou numa sessão viva: guarda a conversa REAL dela (pode ter nascido
@@ -2485,7 +2566,9 @@ class Handler(BaseHTTPRequestHandler):
             self._stream_terminal((qs.get("cid") or [""])[0], (qs.get("s") or [""])[0],
                                   (qs.get("claude") or [""])[0] == "1",
                                   (qs.get("sess") or [""])[0],
-                                  (qs.get("retomar") or [""])[0] == "1")
+                                  (qs.get("retomar") or [""])[0] == "1",
+                                  _qint((qs.get("cols") or [""])[0], 2, 400),
+                                  _qint((qs.get("rows") or [""])[0], 2, 200))
         elif rota == "/painel/tela":
             if not self._term_auth(qs):
                 self._redirect("/painel")
@@ -2880,7 +2963,8 @@ class Handler(BaseHTTPRequestHandler):
         """Terminal: sessão do painel ou token de API (mesma régua de /painel/dados)."""
         return self._sessao() or self._token_ok((qs.get("token") or [""])[0])
 
-    def _stream_terminal(self, cid, sid, claude=False, sess=None, retomar=False):
+    def _stream_terminal(self, cid, sid, claude=False, sess=None, retomar=False,
+                         cols=0, rows=0):
         """Stream da saída do terminal. Shell: PTY atrelado a esta aba (morre
         com ela). Claude: processo VIVO no servidor, chaveado pelo cliente —
         a aba é só uma janela; F5 desanexa, reabrir anexa com o scrollback."""
@@ -2890,7 +2974,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("falta o identificador s da sessão de terminal")
         q = None
         if claude:
-            t, criada = _claude_pegar(cid, sess, retomar)
+            t, criada = _claude_pegar(cid, sess, retomar, cols, rows)
             q = queue.Queue()
             with t["lock"]:
                 historico = bytes(t["buffer"])   # snapshot + inscrição atômicos
@@ -2898,7 +2982,7 @@ class Handler(BaseHTTPRequestHandler):
             print("claude %s (cid=%s)" % ("aberto" if criada else "reanexado", cid),
                   flush=True)
         else:
-            pid, fd = abrir_terminal(cid, False, None, False)
+            pid, fd = abrir_terminal(cid, False, None, False, cols, rows, sid)
             t = {"pid": pid, "fd": fd, "cid": cid, "claude": False,
                  "ultima": time.time(), "lock": threading.Lock()}
             TERMINAIS[sid] = t
