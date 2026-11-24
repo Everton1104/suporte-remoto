@@ -22,6 +22,9 @@ servidor/extensoes/*.vsix
 # prints de tela recebidos no chat do painel (dado de cliente, fora do git)
 servidor/uploads/
 
+# avisos do painel: estado runtime do servidor (avisar.sh anexa linhas)
+servidor/avisos.jsonl
+
 # mais segredos/estado do servidor (2FA, hosts conhecidos, WinPE)
 servidor/2fa.json
 servidor/known_hosts
