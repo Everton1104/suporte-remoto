@@ -21,6 +21,12 @@ DEBS=0
 [ -f "$CONF" ] || { echo "falta $CONF (modelo: cabecalho do proprio conf no git)"; exit 1; }
 # shellcheck disable=SC1090
 source "$CONF"
+if [ "${ATIVO:-}" = "termux" ]; then
+    echo "ativo é o próprio Termux (ATIVO=termux no conf): o espelho mestre já"
+    echo "é servido pelo web.py local — nada a publicar. Se um dia o painel"
+    echo "for publicado por outra máquina, preencha o servidor-ativo.conf."
+    exit 0
+fi
 : "${CID:?}${USUARIO:?}${PASTA:?}${HOST_CF:?}${PORTA_CF:?}"
 
 CHAVE="$BASE/clientes/$CID/chave-tecnico"
