@@ -224,6 +224,12 @@ del "%DIR%\b64.tmp" >nul 2>&1
 
 REM --- 10) servico: tarefa agendada no boot, SYSTEM, sempre rodando ---
 schtasks /create /tn SuporteRemoto /sc onstart /delay 0001:00 /ru SYSTEM /rl HIGHEST /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%DIR%\agente.ps1\"" >nul
+REM     schtasks /create deixa o padrao do Windows "nao iniciar na bateria /
+REM     parar se for pra bateria": em notebook/handheld na bateria a tarefa
+REM     fica Enfileirada pra sempre e o agente nao sobe (pegou na
+REM     DESKTOP-6A1J71K em 26/11 - so pollou 1x no boot com carregador).
+REM     Limpa as 2 flags antes do /run:
+powershell -NoProfile -Command "$t = Get-ScheduledTask SuporteRemoto; $t.Settings.DisallowStartIfOnBatteries = $false; $t.Settings.StopIfGoingOnBatteries = $false; Set-ScheduledTask -InputObject $t" >nul 2>&1
 schtasks /run /tn SuporteRemoto >nul 2>&1
 
 echo.
